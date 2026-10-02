@@ -31,6 +31,7 @@ import { legacyCtx } from "./lib/legacy-ctx.mjs";
 import { registerTools } from "./lib/register-tools.mjs";
 import { registerRoutes } from "./lib/register-routes.mjs";
 import { startService, stopService, serviceRuntimeId, serviceProxyPrefix, serviceProfile } from "./lib/runtime-host.mjs";
+import { bindModels } from "./lib/model-host.mjs";
 import { startNotificationDrain, stopNotificationDrain } from "./lib/notify-drain.mjs";
 
 export const name = APP_ID;
@@ -46,6 +47,12 @@ export async function apply(ctx) {
   const legacyDir = legacyDataDir();
 
   log.info(`${APP_ID} v2 loaded`, { appId: APP_ID, dataDir, legacyDir });
+
+  // ── 1.5 把 ctx 交给模型层 ──
+  // http/ui.js 的默认导出只收 (app, ctx)，而它拿到的是 legacyCtx 投影；
+  // ctx.models 是 v2 真身成员，投影里没有也必须能用 —— 跟 runtime-host 一个套路，
+  // 用 module-level 变量转一手，谁想用谁 import。
+  bindModels(ctx);
 
   try { fs.mkdirSync(dataDir, { recursive: true }); } catch { /* ignore */ }
 

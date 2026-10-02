@@ -343,8 +343,13 @@ body[data-hana-theme="dark"] .account-fields { border-left-color: var(--gold); }
   border: 1px solid var(--border); border-radius: 6px;
   background: var(--paper); overflow: hidden;
 }
-.mail-body-frame { width: 100%; border: 0; height: 64vh; min-height: 360px; background: #fff; display: block; }
-.mail-body-text { white-space: pre-wrap; font-size: 13px; color: var(--ink); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; background: var(--paper); }
+/* iframe 底色必须透明：它自己那层是浏览器默认白，srcdoc 的 body 只铺到内容高度，
+   内容短时底部就露白。透明之后由外层 .mail-body-wrap 的 --paper 透出，深浅色都对。
+   沙箱里没有 allow-scripts，正文高度测不到，所以高度仍由外层给。 */
+.mail-body-frame { width: 100%; border: 0; height: 64vh; min-height: 360px; background: transparent; display: block; }
+.mail-body-text { white-space: pre-wrap; font-size: 13px; color: var(--ink); border: 1px solid var(--border); border-radius: 6px; padding: 12px 14px; background: var(--paper); overflow-wrap: anywhere; }
+.mail-body-text a { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.mail-body-text a:hover { color: var(--accent-dark); }
 
 /* 附件列表 */
 .attachments {
@@ -440,6 +445,8 @@ body[data-hana-theme="dark"] .account-fields { border-left-color: var(--gold); }
 .llm-form .llm-row label { font: 700 11px var(--ui); color: var(--ink-soft); }
 .llm-form .llm-row input, .llm-form .llm-row select { padding: 6px 10px; border: 1px solid var(--border); border-radius: 5px; background: var(--input-bg); color: var(--ink); font-size: 12px; }
 .llm-form .llm-row input:focus, .llm-form .llm-row select:focus { outline: 3px solid rgba(176,141,87,.25); border-color: var(--gold); }
+.llm-option.risky { border-color: var(--gold); }
+.llm-option.risky .risk-tag { margin-left: 8px; font-size: 10px; font-weight: 600; color: var(--gold); }
 .llm-note { margin-top: 10px; font-size: 11px; color: var(--text-muted); line-height: 1.5; max-width: 460px; word-break: break-all; }
 
 /* ── 黑名单 / 白名单列表（6.4） ── */
@@ -556,7 +563,7 @@ setTimeout(function(){try{window.parent.postMessage({source:'hana-plugin',type:'
           <div class="panel" id="addAccountPanel">
             <div class="panel-title" id="addAccountTitle">添加账号</div>
             <form id="addAccountForm" class="field">
-              <input class="inp" id="accName" placeholder="名称（如：奥菲莉娅）" required>
+              <input class="inp" id="accName" placeholder="名称（如：工作邮箱）" required>
               <input class="inp" id="accEmail" placeholder="邮箱地址（决定后端选择）" required>
               <select class="inp" id="accProvider" onchange="updateAccountFields()">
                 <option value="clawemail">ClawEmail（@claw.163.com）</option>
@@ -828,7 +835,7 @@ var NOTI_POLL_MS = 15000; // 15 秒检查一次
 var _notiPollTimer = null;
 var _lastMsgId = {}; // accountId+folderId → latest message id
 
-function showNotification(subject, from, msgId, accountId) {
+function showNotification(subject, from, msgId, accountId, folderId) {
   var c = document.getElementById('noti-container');
   if (!c) return;
   // 如果该邮件已经通知过（相同 id 已经在容器里），跳过
@@ -842,8 +849,9 @@ function showNotification(subject, from, msgId, accountId) {
     '<div class="noti-from">' + esc(from || '(未知发件人)') + '</div>' +
     '<div class="noti-subj">' + svgIcon('mail') + ' ' + esc(subject || '(无主题)') + '</div>';
   el.addEventListener('click', function () {
-    var folderId = state.folderId || 'INBOX';
-    openDetail(msgId, accountId, folderId);
+    // folder 用传进来的那个（= 这封邮件被发现时所在的文件夹），
+    // 不再现取 state.folderId：toast 活 5 秒，够用户把文件夹切走了。
+    openDetail(msgId, accountId, folderId || 'INBOX');
     c.innerHTML = ''; // 关闭所有通知
   });
   c.appendChild(el);
@@ -860,9 +868,9 @@ function checkNewMessages(msgs, accountId, folderId) {
   var prev = _lastMsgId[key];
   if (prev !== undefined && latest.id !== prev) {
     // 页面内 toast
-    showNotification(latest.subject, latest.from, latest.id, accountId);
-    // 桌面原生通知
-    fetchNotifyDesktop(latest.subject, latest.from, latest.id, accountId);
+    showNotification(latest.subject, latest.from, latest.id, accountId, folderId);
+    // 桌面原生通知（folder 一路带到点击回跳，见 notify-drain → notify-click.json）
+    fetchNotifyDesktop(latest.subject, latest.from, latest.id, accountId, folderId);
     // 通知已入队 → 打开「点击可能到来」的快轮询窗口（见 startClickPoll）
     noteClickWindow();
     // v0.1.6：正在查看该文件夹的列表时，自动刷新让新邮件直接出现（无需手动刷新）
@@ -873,10 +881,13 @@ function checkNewMessages(msgs, accountId, folderId) {
   }
   _lastMsgId[key] = latest.id;
 }
-function fetchNotifyDesktop(subject, from, msgId, accountId) {
+function fetchNotifyDesktop(subject, from, msgId, accountId, folderId) {
   api('/notify', {
     method: 'POST',
-    body: JSON.stringify({ subject: subject, sender: from, messageId: msgId, accountId: accountId })
+    body: JSON.stringify({
+      subject: subject, sender: from, messageId: msgId,
+      accountId: accountId, folder: folderId || 'INBOX'
+    })
   }).catch(function () { /* silent */ });
 }
 
@@ -913,7 +924,9 @@ async function clickPollTick() {
         // 隔夜打开卡片不该突然跳到一封旧信上。
         var at = d.data.at ? Date.parse(d.data.at) : 0;
         if (!at || Date.now() - at <= _CLICK_EXPIRE_MS) {
-          openDetail(d.data.messageId, d.data.accountId || state.accountId, state.folderId || 'INBOX');
+          // folder 从点击记录里取；旧记录（没这个字段）和新邮件都在 INBOX，默认给 INBOX
+          // 比拿 state.folderId 安全：后者可能被用户切到了另一个文件夹。
+          openDetail(d.data.messageId, d.data.accountId || state.accountId, d.data.folder || 'INBOX');
         }
       }
     }
@@ -1116,7 +1129,9 @@ function rewriteImages(html, atts, messageId) {
   }
 
   // 2) 外部 http(s) 图片 → 视 USE_IMAGE_PROXY 决定是否走插件代理（避开 iframe 沙箱外网限制）
-  // 只处理 <img src="...">（双引号/单引号）和 CSS url(...)；不动 <a href>。
+  // 只处理 <img src="...">（双引号/单引号）和 CSS url(...)；<a href> 不在这里动，
+  // 由 rewriteLinks 单独处理——两者关心的是不同的东西：这里解决「能不能加载」，
+  // 那里解决「点了往哪去」。
   if (USE_IMAGE_PROXY) {
     html = html.replace(/<img\b([^>]*?)\bsrc="(https?:\/\/[^"]+)"/gi, function (full, attrs, src) {
       return '<img' + attrs + 'src="' + proxyUrl(src) + '"';
@@ -1137,6 +1152,68 @@ function rewriteImages(html, atts, messageId) {
 function proxyUrl(externalUrl) {
   return API_BASE + '/image-proxy?url=' + encodeURIComponent(externalUrl) +
     (_surfaceToken ? '&appSurfaceSession=' + encodeURIComponent(_surfaceToken) : '');
+}
+
+/* ── 正文里的链接：沙箱 iframe 的唯一出路 ─────────────────
+ * 正文 frame 的 sandbox 只有 allow-popups：没有 allow-top-navigation，
+ * 宿主无从拦下外链；没有 allow-scripts，脚本方案也不成立。
+ * 所以无 target 的 <a> 会在正文框【内部】导航 —— 把邮件本体换成目标网页，
+ * 而那个网页因为沙箱没脚本支持，还是残缺的。
+ * allow-popups 是沙箱里唯一能把链接交出去的通道：给每个 <a> 补 target="_blank"。
+ *
+ * 明写的 javascript: / data: / vbscript: 顺手摘掉 href。实体编码（&#106;avascript:）
+ * 这类写法挡不住——但沙箱本来就没有 allow-scripts，javascript: 在这里执行不了。
+ * 这一层是纵深防御的第二道，不是唯一那道，别把它当沙箱的替代品。 */
+function rewriteLinks(html) {
+  if (!html) return html;
+  var hrefRe = /\s*\bhref\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s>]+))/i;
+  // 标签名用捕获组原样带回：<A 改写后还是 <A。HTML 不区分大小写，
+  // 但改写不该悄悄把原文的东西换成另一个写法。
+  return html.replace(/(<a)\b([^>]*)>/gi, function (full, open, attrs) {
+    var hm = attrs.match(hrefRe);
+    var url = hm ? decodeBasic(hm[1] || hm[2] || hm[3] || "") : "";
+    if (/^\s*(javascript|data|vbscript):/i.test(url)) {
+      return open + attrs.replace(hrefRe, "") + ">";
+    }
+    var keep = attrs.replace(/\s+\b(?:target|rel)\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "");
+    return open + keep + ' target="_blank" rel="noopener noreferrer">';
+  });
+}
+
+// 只用于判断「是不是伪协议」：把 &amp; 还原，实体开头的 # 拉平。
+// 不是完整的实体解码器，也不该是——真正的解码交给浏览器。
+function decodeBasic(s) {
+  return String(s).replace(/&amp;/g, '&').replace(/&#(x)?/gi, '#');
+}
+
+/* ── 纯文本正文里的裸链 ──────────────────────────────────
+ * 以前 textContent 直出，验证码、激活链接一概不可点。
+ * 全部用 DOM 节点拼，不拼 innerHTML —— 正文是不可信输入，这里不留 XSS 面。 */
+var LINKIFY_RE = /(?:https?:\/\/|www\.)[^\s<>"'，。；！？]+|[\w.+-]+@[\w-]+(?:\.[\w-]+)+/g;
+function linkifyTextInto(el, text) {
+  el.textContent = '';
+  var s = String(text == null ? '' : text);
+  var last = 0, m;
+  LINKIFY_RE.lastIndex = 0;
+  while ((m = LINKIFY_RE.exec(s)) !== null) {
+    if (m[0].length === 0) { LINKIFY_RE.lastIndex++; continue; }
+    if (m.index > last) el.appendChild(document.createTextNode(s.slice(last, m.index)));
+    var raw = m[0];
+    // 尾巴上的中文标点、英文句读不算进 URL
+    raw = raw.replace(/[.,;:!?)\]}'"、，。；：！？）】]+$/, '');
+    var href = /^@/.test(raw) || (/^[\w.+-]+@/.test(raw) && !/^https?:|^www\./i.test(raw))
+      ? 'mailto:' + raw
+      : /^www\./i.test(raw) ? 'http://' + raw
+      : raw;
+    var a = document.createElement('a');
+    a.href = href;
+    a.textContent = raw;
+    a.target = '_blank';
+    a.rel = 'noopener noreferrer';
+    el.appendChild(a);
+    last = m.index + raw.length;
+  }
+  if (last < s.length) el.appendChild(document.createTextNode(s.slice(last)));
 }
 
 /* ── 全局状态 ── */
@@ -1243,12 +1320,15 @@ function selectAccount(id) {
   loadFolders(id);
 }
 
-function loadFolders(accountId) {
+// preferredFolderId：切账号时指定想停在哪个文件夹（通知回跳带来的）。
+// 不传就是原来的行为：保留当前 state.folderId，不存在则回 INBOX。
+function loadFolders(accountId, preferredFolderId) {
   api('/folders?accountId=' + encodeURIComponent(accountId)).then(function (r) { return r.json(); }).then(function (d) {
     var folders = (d.data && d.data.length) ? d.data : DEFAULT_FOLDERS;
     state.folders = folders;
-    var known = folders.some(function (f) { return f.id === state.folderId; });
-    if (!known) state.folderId = 'INBOX';
+    var want = preferredFolderId || state.folderId;
+    var known = folders.some(function (f) { return f.id === want; });
+    state.folderId = known ? want : 'INBOX';
     renderFolders();
     loadMessages(state.accountId, state.folderId);
   }).catch(function () {
@@ -1412,11 +1492,26 @@ function extractBody(m) {
   return { html: html, text: text };
 }
 
-function openDetail(messageId) {
+// accountId / folderId 可选，不传就是当前 UI 状态。
+// 两处通知回跳传的是「这封邮件自己的」账号：多账号下不接这两个参数，
+// 就会拿当前选中账号去取另一个账号的邮件，必然加载失败——
+// 而函数原先只声明 messageId，调用点传的三个参数被静默丢掉。
+function openDetail(messageId, accountId, folderId) {
+  var aid = accountId || state.accountId;
+  var fid = folderId || state.folderId || 'INBOX';
+  var switched = aid && aid !== state.accountId;
   var box = document.getElementById('detailBox');
   box.innerHTML = '<div class="loading">加载邮件…</div>';
   navigateTo('detail');
-  api('/messages/' + encodeURIComponent(messageId) + '?accountId=' + encodeURIComponent(state.accountId) + '&folder=' + encodeURIComponent(state.folderId || 'INBOX')).then(function (r) { return r.json(); }).then(function (d) {
+  if (switched) {
+    // 侧标跟着走，返回时列表停在同一账号；详情已按局部 aid/fid 发出，
+    // loadFolders 之后就算把 state.folderId 改了也影响不到这一请求。
+    state.accountId = aid;
+    document.querySelectorAll('.acct').forEach(function (b) { b.classList.toggle('active', b.dataset.acct === aid); });
+    state.folderId = fid;
+    loadFolders(aid, fid);
+  }
+  api('/messages/' + encodeURIComponent(messageId) + '?accountId=' + encodeURIComponent(aid) + '&folder=' + encodeURIComponent(fid)).then(function (r) { return r.json(); }).then(function (d) {
     if (!d.ok) { box.innerHTML = '<div class="empty">加载失败：' + esc(d.error || '未知错误') + '</div>'; return; }
     var m = d.data;
     if (!m) { box.innerHTML = '<div class="empty">邮件不存在</div>'; return; }
@@ -1450,10 +1545,10 @@ function openDetail(messageId) {
     if (b.html) {
       var f = box.querySelector('iframe.mail-body-frame');
       // 把 cid: 内嵌图与外部 http(s) 图片都改写成可被沙箱 iframe 加载的地址
-      var frameHtml = rewriteImages(b.html, m.attachments, m.id);
+      var frameHtml = rewriteLinks(rewriteImages(b.html, m.attachments, m.id));
       f.srcdoc = injectBodyTheme(frameHtml);
     } else if (b.text) {
-      box.querySelector('.mail-body-text').textContent = b.text;
+      linkifyTextInto(box.querySelector('.mail-body-text'), b.text);
     }
     // 自动标记已读（如果之前是未读）
     if (m.read === false) {
@@ -1544,7 +1639,8 @@ function markRead(messageId, read) { return markReadStatus(messageId, read); }
 // 调用后端 LLM 做总结 / 翻译，结果渲染到详情页 ai-panel
 function aiAction(action, messageId) {
   if (!state.accountId || !messageId) { toast('请先选择账号'); return; }
-  // 检查 LLM 配置（v0.1.7+ 只存 provider/model，baseUrl/apiKey 由后端从 catalog 回源）
+  // 只存 provider/model 两个字段（v0.6.13）：模型列表来自宿主契约 ctx.models，
+  // 凭据、endpoint、API 协议全部留在宿主侧，前端与后端都不接触 key。
   var cfg = getLlmConfig();
   if (!cfg || !cfg.provider || !cfg.model) {
     toast('请先在「AI 总结 / 翻译 供应商」面板选择 LLM（AI 总结/翻译需要）');
@@ -2186,8 +2282,15 @@ function renderLlmDropdown() {
     html += '<div class="llm-group"><div class="llm-group-header">' + esc(pid) + '</div>';
     byP[pid].forEach(function (it) {
       var sel = cur && cur.provider === it.provider && cur.model === it.model;
-      html += '<button type="button" class="llm-option' + (sel ? ' selected' : '') + '" data-provider="' + esc(it.provider) + '" data-model="' + esc(it.model) + '">' +
-        esc(it.model) + (sel ? '<span class="check">✓</span>' : '') + '</button>';
+      // hostIdOk=false 不是「不能用」，是「走另一扇门」：宿主契约不收这个名字，
+      // 但 bus 能取到凭据、能直连供应商。标出来只为了说明凭据去哪了。
+      var alt = it.hostIdOk === false;
+      html += '<button type="button" class="llm-option' + (sel ? ' selected' : '') + (alt ? ' risky' : '') + '"' +
+        (alt ? ' title="provider 名不合宿主契约的 ASCII 规则，改走 bus 取凭据直连供应商；密钥只在服务端流转"' : '') +
+        ' data-provider="' + esc(it.provider) + '" data-model="' + esc(it.model) + '">' +
+        esc(it.model) +
+        (alt ? '<span class="risk-tag">直连</span>' : '') +
+        (sel ? '<span class="check">✓</span>' : '') + '</button>';
     });
     html += '</div>';
   });
@@ -2223,7 +2326,8 @@ function detectLlm() {
     if (!d.ok || !Array.isArray(d.data) || !d.data.length) {
       _llmItems = [];
       renderLlmTrigger();
-      showLlmStatus('err', '未检测到已添加的供应商：请在 HanaAgent 全局设置里添加 LLM 供应商');
+      // 后端把「是哪一层空」算好了，直接显示 —— 否则这句话会把人引去改一个本来就对的地方。
+      showLlmStatus('err', d.hint || '未检测到已添加的供应商：请在 HanaAgent 全局设置里添加 LLM 供应商');
       return false;
     }
     _llmItems = d.data;
@@ -2233,7 +2337,11 @@ function detectLlm() {
       setLlmConfig(null);
     }
     renderLlmTrigger();
-    showLlmStatus('ok', '已加载 ' + d.data.length + ' 个模型（来自已添加供应商），请选择');
+    if (d.hint) {
+      showLlmStatus('ok', '已加载 ' + d.data.length + ' 个模型（宿主契约 ' + d.fromContract + ' + bus 补位 ' + d.fromBus + '）—— ' + d.hint + '，请选择');
+    } else {
+      showLlmStatus('ok', '已加载 ' + d.data.length + ' 个模型（宿主契约 ' + d.fromContract + ' + bus 补位 ' + d.fromBus + '），请选择');
+    }
     return true;
   }).catch(function () { showLlmStatus('err', '检测失败'); return false; });
 }
@@ -2289,9 +2397,9 @@ function showLlmStatus(type, msg) {
 loadAccounts();
 setTimeout(startPolling, 1000); // 等账号加载完开始轮询新邮件
 startNotiStatus();              // 通知链路状态（10 秒一轮）
-// 自动检测 Hanako LLM 配置（无需用户填写 URL / Key）
+// 自动拉取宿主可用模型列表（无需用户填写 URL / Key）
 setTimeout(function () {
-  if (!getLlmConfig() || !getLlmConfig().agentId) detectLlm();
+  if (!getLlmConfig()) detectLlm();
 }, 800);
 </script>
 </body>

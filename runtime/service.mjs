@@ -436,6 +436,9 @@ function queueNotification(payload) {
       sender: payload.sender || "",
       messageId,
       accountId: payload.accountId || "",
+      // 实时监听那两条（imap-idle / ws-monitor）直接写目录、不经这里，
+      // 它们没这个字段 —— 读取侧默认 INBOX，与它们的语义一致。
+      folder: payload.folder || "INBOX",
       queuedAt: new Date().toISOString(),
     }), "utf-8");
     return { ok: true, queued: true };
@@ -533,6 +536,9 @@ function armClickPipe(meta) {
                 action: kv.action,
                 messageId: meta?.messageId || "",
                 accountId: meta?.accountId || "",
+                // 点开要跳回哪一封：光有 messageId 不够，读信 API 还.folder 参数。
+                // 卡片那边如果拿当前浏览的 folder 去顶替，就会取错文件夹里的这封。
+                folder: meta?.folder || "INBOX",
                 // 汇总通知（一波 ≥3 封合并）才有这个值；单封为 0。
                 // 写进点击记录是为了让卡片能区分「点开一封」与「点开一批」。
                 summaryCount: Number(meta?.summaryCount) || 0,
@@ -789,6 +795,7 @@ async function handle(req, res) {
       return send(res, 200, await armClickPipe({
         messageId: body.messageId,
         accountId: body.accountId,
+        folder: body.folder,
         summaryCount: body.summaryCount,
       }));
     }

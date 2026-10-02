@@ -2,11 +2,11 @@
   "manifestVersion": 2,
   "id": "hanako-mail",
   "name": "Hanako Mail",
-  "version": "0.6.10",
+  "version": "0.6.15",
   "description": "多邮箱聚合管理：ClawEmail / AgentQQ 官方 API + 个人邮箱 IMAP/SMTP，支持多账号、文件夹、已读未读、回复、搜索、AI 总结翻译与实时收件通知。",
   "minAppVersion": "0.946.2",
   "entry": "index.js",
-  "icon": "assets/icon.png",
+  "icon": "assets/icon-v11.png",
   "capabilities": [
     "app/tools.expose-to-model",
     "app/process.spawn",
@@ -14,6 +14,7 @@
     "app/runtime.native",
     "app/runtime.local-machine",
     "app/runtime.network",
+    "app/models.infer",
     "app/models.read",
     "app/provider.credentials.read",
     "app/ui.open-external",
@@ -31,7 +32,7 @@
         "siteNavEntry": false,
         "detached": { "route": "/mail.html" },
         "detachedDefaultSize": { "width": 1200, "height": 800 },
-        "face": { "image": "face.png" }
+        "face": { "image": "face-v4.png" }
       }
     ]
   }

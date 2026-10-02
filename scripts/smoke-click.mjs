@@ -135,7 +135,7 @@ if (!ownOk) {
   const SUBJECT = "【自检】点击回调（服务拥有管道）";
   const argsFile = path.join(dataDir, "notify-args-smoke.json");
   fs.writeFileSync(argsFile, JSON.stringify({
-    subject: SUBJECT, sender: "奥菲莉娅", messageId: "click-b", accountId: "acc-b",
+    subject: SUBJECT, sender: "测试发件人", messageId: "click-b", accountId: "acc-b",
   }), "utf-8");
 
   const child = spawn(process.execPath, [

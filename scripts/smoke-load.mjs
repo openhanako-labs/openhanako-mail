@@ -29,6 +29,19 @@ function check(name, ok, detail = "") {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}${detail ? `  ${detail}` : ""}`);
   if (!ok) failed++;
 }
+/**
+ * 剥掉注释行，只留代码。
+ * 给「某段旧代码不该再出现」这类断言用 —— 否则注释里提一句旧名字就把断言打红，
+ * 而那些注释正是我们想让下一个人看懂的东西。
+ * 判定：行首（去空白后）以 // 或 * 开头的算注释行。够用且不会误伤行内字符串。
+ */
+function codeOnly(src) {
+  return src
+    .split("\n")
+    .filter((l) => !/^\s*(\/\/|\*)/.test(l))
+    .join("\n");
+}
+
 
 // ── 造一个隔离的 HANA_HOME ──
 const home = fs.mkdtempSync(path.join(os.tmpdir(), "mail-smoke-"));
@@ -151,10 +164,6 @@ check("backend/lib 里不再有 childEnv 引用", (() => {
   if (hits.length) console.log("      残留:", hits.join(", "));
   return hits.length === 0;
 })());
-
-const { postJson } = await load("backend/net-child.mjs");
-const netDown = await postJson("http://127.0.0.1:1/x", { timeoutMs: 1000 });
-check("net-child 在服务不可用时也返回 ok:false（不抛）", netDown?.ok === false, JSON.stringify(netDown).slice(0, 120));
 
 let runCliThrew = false;
 const { runCli } = await load("backend/worker-client.mjs");
@@ -432,6 +441,97 @@ check("卡片从自己 URL 路径提取 surface session token",
   mailHtml.includes("ui\\/_surface\\/"));
 check("卡片把 token 放进 X-Hana-App-Surface-Session 头", mailHtml.includes("X-Hana-App-Surface-Session"));
 check("附件/图片代理 URL 改走 appSurfaceSession 查参数", mailHtml.includes("appSurfaceSession="));
+
+// ── 跳转链接与通知回跳（2026-10-02）─────────────────
+// 正文 iframe 的 sandbox 只有 allow-popups：没有 allow-top-navigation 就没人拦得到外链，
+// <a> 不补 target 就会在正文框【内部】导航，把邮件本体换成目标网页。
+check("★ 正文链接由 rewriteLinks 补 target，且真的被调用",
+  /function rewriteLinks\(/.test(mailHtml) && mailHtml.includes("rewriteLinks(rewriteImages("));
+// openDetail 以前只声明 messageId，两个调用点却传了三个参数，accountId 被静默丢弃——
+// 多账号下停在 A 点 B 的通知，就会拿 A 的身份去取 B 的邮件。
+check("★ openDetail 声明并用上了 accountId / folderId",
+  /function openDetail\(messageId, accountId, folderId\)/.test(mailHtml) &&
+  mailHtml.includes("encodeURIComponent(aid)"));
+// 正文框底色写死 #fff：srcdoc 的 body 只铺到内容高度，内容短时底部露白，深色主题下更明显。
+check("★ 正文 iframe 不硬编码白底",
+  !/\.mail-body-frame\s*\{[^}]*background:\s*#fff/.test(mailHtml));
+// 纯文本正文以前 textContent 直出，裸 URL 不可点（验证码、激活链接一概如此）。
+check("★ 纯文本正文做 linkify", mailHtml.includes("linkifyTextInto(box.querySelector"));
+// folder 必须一路带到点击回跳：卡片轮询的是用户当前浏览的文件夹，不恒为 INBOX。
+const notifySvc = fs.readFileSync(path.join(ROOT, "runtime", "service.mjs"), "utf-8");
+const notifyDrain = fs.readFileSync(path.join(ROOT, "lib", "notify-drain.mjs"), "utf-8");
+const notifyUi = fs.readFileSync(path.join(ROOT, "http", "ui.js"), "utf-8");
+check("★ folder 从卡片透传进通知队列",
+  notifyUi.includes("folder: body.folder") && notifySvc.includes("folder: payload.folder"));
+check("★ folder 进 arm meta 并写进点击记录",
+  notifySvc.includes("folder: body.folder") &&
+  notifySvc.includes('folder: meta?.folder || "INBOX"'));
+check("★ 派发器 arm 时带上 folder", notifyDrain.includes("folder: one.folder"));
+check("★ 卡片回跳优先用点击记录里的 folder，不拿当前浏览的顶替",
+  /d\.data\.folder \|\| ['"]INBOX['"]/.test(mailHtml));
+
+// ── AI 走宿主契约（v0.6.13）─────────────────────────
+// 旧路径（读 provider-catalog + bus 取凭据 + 借服务代发 HTTP + 自己分两种协议拼请求）
+// 整块删了：app/models.infer 的语义就是「凭据由宿主保管」，插件侧不该再有那一套。
+// 这组断言守的是「别把旧路径改回来」。
+const modelHost = fs.readFileSync(path.join(ROOT, "lib", "model-host.mjs"), "utf-8");
+const llmSrc = fs.readFileSync(path.join(ROOT, "backend", "llm.mjs"), "utf-8");
+const manifestCaps = JSON.parse(fs.readFileSync(path.join(ROOT, "manifest.json"), "utf-8")).capabilities || [];
+
+check("★ 模型列表只来自宿主契约，旧数据源一个字不剩",
+  notifyUi.includes("listHostModels()") &&
+    !/getProviderCatalog|resolveLlmConfig|listChatModels|provider-catalog|PROVIDER_PRESETS/.test(codeOnly(notifyUi)));
+check("★ 推理只有一个入口 inferText（门一直连只是它的兜底分支，不是另一套调用链）",
+  /async function runAi/.test(notifyUi) && notifyUi.includes("llm.pingPrompt") &&
+    !/chatCompletion|net-child|summarizeMail\(|translateMail\(/.test(codeOnly(notifyUi)) &&
+    !/inferDirect/.test(codeOnly(notifyUi)));
+check("★ backend/llm.mjs 只剩提示词，碰不到 baseUrl / apiKey / 网络",
+  !/postJson|fetch\(|baseUrl|apiKey|hostConfig|net-child/.test(codeOnly(llmSrc)) &&
+    llmSrc.includes("summarizePrompt") && llmSrc.includes("translatePrompt"));
+check("★ 标识符规则只用于标注，不拿它删用户自己加的模型",
+  /normalizedModels/.test(modelHost) && /hostIdOk/.test(modelHost) &&
+    !/sendableModels/.test(codeOnly(modelHost)) &&
+    !/不满足宿主标识符要求[\s\S]{0,80}return/.test(codeOnly(modelHost)));
+check("★ 推理不做本地预检，能不能用由宿主说了算",
+  !/if \(!isSendable\(\{ provider, id: model \}\)\)/.test(codeOnly(modelHost)));
+check("★ 宿主模型层静默挂住这条，有超时 + cancel 兜着",
+  /内没有响应/.test(modelHost) && /models\.cancel\(requestId\)/.test(modelHost));
+check("★ 空返回要说出来，不能长得像成功",
+  modelHost.includes("模型没有返回正文"));
+check("★ 三条模型相关能力位全要（门一不收的名字由门二兜）",
+  manifestCaps.includes("app/models.infer") &&
+    manifestCaps.includes("app/models.read") &&
+    manifestCaps.includes("app/provider.credentials.read"));
+
+// ── 门二：直连兜底（v0.6.15）──────────────────────
+// 实测事实：宿主 ctx.models 对 provider 做 ASCII 校验（bundle 里的 tg()），
+// 而 bus 的 provider:credentials 只把 providerId 当查表键 —— 中文名在门一进不去、
+// 在门二能用。只要门一，用户自己加的「中文provider」这类供应商就永远用不了。
+const llmDirect = fs.readFileSync(path.join(ROOT, "backend", "llm-direct.mjs"), "utf-8");
+check("★ 门二存在且拿凭据只走 bus，不去读 HANA_HOME 里的目录",
+  /async function fetchCredentials/.test(llmDirect) &&
+    llmDirect.includes('"provider:credentials"') &&
+    !/provider-catalog|getProviderCatalog|readFileSync/.test(codeOnly(llmDirect)));
+check("★ 门二的出站借受管服务（AppHost 本身没有网）",
+  llmDirect.includes('callService("/http"'));
+check("★ 凭据取到后不出模块边界（fetchCredentials 不导出，ui.js 调不到它）",
+  !/export async function fetchCredentials/.test(llmDirect) &&
+    !/fetchCredentials/.test(codeOnly(notifyUi)));
+check("★ LLM 相关响应不回 apiKey（邮箱账号自己的 apiKey 不算，那走另一套加密）",
+  !/ok: true[^\n]*apiKey/.test(codeOnly(notifyUi)));
+check("★ 门一失败回落门二，但超时不回落（重试等于两次请求两份钱）",
+  /if \(!timedOut && _ctx\)/.test(modelHost));
+check("★ 门一失败回落门二，但超时不回落（重试等于两次请求两份钱）",
+  /bus-after-gate1-fail/.test(modelHost) && /if \(!timedOut && _ctx\)/.test(modelHost));
+check("★ 列表是两扇门合流，不再只报「过滤了多少」",
+  notifyUi.includes("fromContract") && notifyUi.includes("fromBus") &&
+    !/suspectIds/.test(codeOnly(notifyUi)));
+check("★ 推理不做本地硬拒，名字不合规则就换门而不是报错",
+  /if \(!hostAccepts\(provider, model\)\)/.test(modelHost) &&
+    !/不满足宿主标识符要求.*return \{\s*ok: false/.test(codeOnly(modelHost)));
+check("★ 旧模块确实已从包里移除",
+  !fs.existsSync(path.join(ROOT, "backend", "hana-llm.mjs")) &&
+    !fs.existsSync(path.join(ROOT, "backend", "net-child.mjs")));
 
 console.log(`\nsmoke-load: ${failed} failure(s)`);
 process.exit(failed === 0 ? 0 : 1);

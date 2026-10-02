@@ -4,8 +4,8 @@ import os from "node:os";
 import { fileURLToPath } from "node:url";
 
 import * as llm from "../backend/llm.mjs";
-// 镜像 hana-code-atlas（代码图谱）：通过 ctx.bus 向 Hanako 宿主解析真实模型配置
-import { resolveLlmConfig, listChatModels, getProviderCatalog } from "../backend/hana-llm.mjs";
+// 宿主模型契约（app/models.infer）：凭据、endpoint、协议全在宿主侧，本层不碰。
+import { listHostModels, inferText } from "../lib/model-host.mjs";
 import * as blocklist from "../backend/blocklist.mjs";
 import { htmlToText } from "../backend/common.mjs";
 // 后端依赖清单的判定只有一份（从 backend/package.json 推导），见 backend/deps.mjs
@@ -225,56 +225,35 @@ const getImageProxy = async (c) => {
   }
 };
 
-// 从 agent 的 config.yaml 解析真实 LLM 凭据（仅服务端使用，key 不返回前端）
-async function resolveAgentYamlLlm(agentId) {
-  if (!agentId) return null;
-  const cfgPath = path.join(os.homedir(), ".hanako", "agents", agentId, "config.yaml");
-  try {
-    if (!fs.existsSync(cfgPath)) return null;
-    const cfg = parseSimpleYaml(fs.readFileSync(cfgPath, "utf-8"));
-    const apiKey = asStr(cfg?.api?.api_key || cfg?.api_key || "").trim();
-    if (!apiKey) return null;
-    const baseUrl = asStr(cfg?.api?.base_url || cfg?.api?.endpoint || "");
-    const chatObj = cfg?.models?.chat;
-    const model = (chatObj && typeof chatObj === "object") ? asStr(chatObj.id) : (typeof chatObj === "string" ? chatObj : "");
-    return { apiKey, baseUrl, model };
-  } catch {
-    return null;
+/**
+ * 一次 AI 调用：提示词 + 用户选中的模型 → 宿主契约 ctx.models。
+ *
+ * 只认 provider / model 两个字段：它们来自 /llm-detect，而那份列表已经按宿主的
+ * 标识符规则过滤过（中文、空格、斜杠的名字进不去），所以这里不必再校验一遍。
+ *
+ * 没有「猜一个默认供应商」这种回落。宁可让用户去点一下选择器，
+ * 也不要静默换个模型跑出来一段看不出问题的总结 —— 那种失败最难查。
+ */
+async function runAi(prompt, llmCfg, body = {}) {
+  const provider = String(llmCfg?.providerId || llmCfg?.provider || body?.providerId || "").trim();
+  const model = String(llmCfg?.model || body?.model || "").trim();
+  if (!provider || !model) {
+    return { ok: false, error: "还没选模型：请在「AI 设置」里选一个供应商与模型（列表来自宿主模型目录）" };
   }
-}
-
-// 解析 LLM 调用选项：配置引用优先，真实 key 一律服务端回源，绝不信任前端传的明文 apiKey。
-// 用户不需要（也不允许）手填 URL / API Key —— 直接从 Hanako 宿主或本机 agent 配置读取。
-// 引用形式（来自 /llm-detect 检测结果）：
-//   { agentId }                → 从 ~/.hanako/agents/<agentId>/config.yaml 读取 url + key + model
-//   { providerId, model }      → 从宿主 provider:credentials 解析 baseUrl + apiKey
-// 兜底：llm.mjs 内部的环境变量（HANAKO_LLM_* / OPENAI_*）
-async function buildLlmOpts(ctx, llmCfg, body = {}) {
-  const cfg = llmCfg || {};
-  // 1) agent 配置引用（config.yaml 内已有真实 apiKey，服务端回源，最贴合"直接读取 url 和 api"）
-  if (cfg.agentId) {
-    const ay = await resolveAgentYamlLlm(cfg.agentId);
-    if (ay && ay.apiKey) {
-      return {
-        baseUrl: (cfg.baseUrl && !String(cfg.baseUrl).includes("****")) ? cfg.baseUrl : (ay.baseUrl || ""),
-        apiKey: ay.apiKey,
-        model: cfg.model || ay.model,
-      };
-    }
+  const r = await inferText({
+    provider,
+    model,
+    messages: [{ role: "user", content: prompt.user }],
+    systemPrompt: prompt.system || undefined,
+    maxTokens: prompt.maxTokens,
+    temperature: prompt.temperature,
+    timeoutMs: 120_000,
+  });
+  if (!r.ok) {
+    return { ok: false, error: `${provider} / ${model}：${r.error}`, timedOut: !!r.timedOut };
   }
-  // 2) 宿主聊天供应商（providerId + model 引用，凭据由宿主管理）
-  try {
-    const resolved = await resolveLlmConfig(ctx, {
-      providerId: cfg.providerId || cfg.provider || body?.providerId,
-      model: cfg.model || body?.model,
-    });
-    if (resolved.ok) return { baseUrl: resolved.baseUrl, apiKey: resolved.apiKey, model: resolved.model, api: resolved.api };
-    ctx?.log?.warn?.("mail_llm.resolve_failed", { error: resolved.error });
-  } catch (e) {
-    ctx?.log?.warn?.("mail_llm.resolve_exception", { error: e?.message });
-  }
-  // 3) 环境变量兜底（llm.mjs 内部处理），返回空对象即可
-  return {};
+  // gate 带回去：同一个模型走哪条路，用户应该看得见（直连时凭据确实经过了本 App）。
+  return { ok: true, text: r.text, usage: r.usage, requestId: r.requestId, via: r.gate || r.via || "contract" };
 }
 
 // 从邮件对象抽取发件人邮箱（兼容 from 为字符串 / 数组 / {address} 对象）
@@ -663,7 +642,7 @@ export default function (app, ctx) {
     const accountId = body?.accountId || "";
     const messageId = body?.messageId || "";
     const targetLang = body?.targetLang || "中文";
-    const llmCfg = body?.llmConfig || null; // 前端传来的自定义 LLM 配置
+    const llmCfg = body?.llmConfig || null; // 只包含 { provider, model } 引用，不带凭据
     if (!accountId || !messageId) return c.json({ ok: false, error: "accountId 和 messageId 必填" });
     const account = resolveAccount(accounts(), accountId);
     if (!account) return c.json({ ok: false, error: "account not found" });
@@ -673,10 +652,10 @@ export default function (app, ctx) {
 
     try {
       const text = await readMailPlain(account, messageId);
-      // 配置来源：前端自定义 > 宿主真实配置（provider:credentials）> 环境变量兜底
-      const opts = await buildLlmOpts(ctx, llmCfg, body);
-      const summary = await llm.summarizeMail(text, targetLang, opts);
-      return c.json({ ok: true, data: summary });
+      const r = await runAi(llm.summarizePrompt(text, targetLang), llmCfg, body);
+      return r.ok
+        ? c.json({ ok: true, data: r.text, usage: r.usage, via: r.via })
+        : c.json({ ok: false, error: r.error, timedOut: r.timedOut });
     } catch (e) {
       return c.json({ ok: false, error: String(e.message || e) });
     }
@@ -697,9 +676,10 @@ export default function (app, ctx) {
 
     try {
       const text = await readMailPlain(account, messageId);
-      const opts = await buildLlmOpts(ctx, llmCfg, body);
-      const translated = await llm.translateMail(text, targetLang, opts);
-      return c.json({ ok: true, data: translated });
+      const r = await runAi(llm.translatePrompt(text, targetLang), llmCfg, body);
+      return r.ok
+        ? c.json({ ok: true, data: r.text, usage: r.usage, via: r.via })
+        : c.json({ ok: false, error: r.error, timedOut: r.timedOut });
     } catch (e) {
       return c.json({ ok: false, error: String(e.message || e) });
     }
@@ -931,175 +911,75 @@ export default function (app, ctx) {
     }
   };
 
-  // ── LLM 配置检测与测试 ──
-  // 检测 Hanako 本体 / 环境变量中的 LLM 配置
-  // 把 YAML 解析出的各种类型归一化为字符串（对象/布尔/数字 → 字符串或空）
-  function asStr(v) {
-    if (v === null || v === undefined) return "";
-    if (typeof v === "string") return v;
-    if (typeof v === "boolean" || typeof v === "number") return String(v);
-    return ""; // 对象（如空 map {}）→ 视为未设置
-  }
+  // ── LLM：模型列表与连接自检 ─────────────────────────────
+  //
+  // 只有一个数据源：宿主契约 ctx.models（能力位 app/models.infer）。
+  // 这一段以前是「读 provider-catalog.json + bus provider:credentials +
+  // PROVIDER_PRESETS 猜 Base URL + 借受管服务代发 HTTP」，v0.6.13 整块删除。
+  // 凭据、endpoint、API 协议、用量记账都在宿主侧，本层拿不到 key —— 这是设计，不是缺能。
 
-  // ── 轻量 YAML 解析（处理嵌套 map + 标量值；忽略 list 细节，仅取我们需要的字段）──
-  function parseSimpleYaml(text) {
-    const lines = String(text || "").split(/\r?\n/);
-    const root = {};
-    const stack = [{ indent: -1, node: root }];
-    const top = () => stack[stack.length - 1];
-
-    for (const raw of lines) {
-      if (!raw.trim() || raw.trimStart().startsWith("#")) continue;
-      const indent = raw.match(/^(\s*)/)[1].replace(/\t/g, "  ").length;
-      let content = raw.trim().replace(/\s+#.*$/, ""); // 去掉行尾注释
-      if (/^-\s/.test(content)) continue; // 列表项跳过（我们只需要标量路径）
-
-      const m = content.match(/^([^:]+):\s*(.*)$/);
-      if (!m) continue;
-      const key = m[1].trim();
-      let value = m[2].trim();
-      if ((value.startsWith('"') && value.endsWith('"')) || (value.startsWith("'") && value.endsWith("'"))) {
-        value = value.slice(1, -1);
-      }
-
-      while (stack.length > 1 && top().indent >= indent) stack.pop();
-
-      if (value === "") {
-        const newNode = {};
-        top().node[key] = newNode;
-        stack.push({ indent, node: newNode });
-      } else {
-        if (value.startsWith("[") && value.endsWith("]")) {
-          value = value.slice(1, -1).split(",").map((s) => s.trim()).filter(Boolean);
-        } else if (value === "true") value = true;
-        else if (value === "false") value = false;
-        else if (value !== "" && !isNaN(Number(value))) value = Number(value);
-        top().node[key] = value;
-      }
-    }
-    return root;
-  }
-
-  // 常见供应商 → OpenAI 兼容 Base URL 预设（best-effort，用户可在 UI 覆盖）
-  const PROVIDER_PRESETS = {
-    openai: "https://api.openai.com/v1",
-    deepseek: "https://api.deepseek.com/v1",
-    anthropic: "https://api.anthropic.com/v1",
-    moonshot: "https://api.moonshot.cn/v1",
-    kimi: "https://api.moonshot.cn/v1",
-    qwen: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    aliyun: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    dashscope: "https://dashscope.aliyuncs.com/compatible-mode/v1",
-    zhipu: "https://open.bigmodel.cn/api/paas/v4",
-    glm: "https://open.bigmodel.cn/api/paas/v4",
-    ollama: "http://localhost:11434/v1",
-    grok: "https://api.x.ai/v1",
-    xai: "https://api.x.ai/v1",
-    gemini: "https://generativelanguage.googleapis.com/v1beta/openai",
-    google: "https://generativelanguage.googleapis.com/v1beta/openai",
-    together: "https://api.together.xyz/v1",
-    siliconflow: "https://api.siliconflow.cn/v1",
-    volcengine: "https://ark.cn-beijing.volces.com/api/v3",
-    baichuan: "https://api.baichuan-ai.com/v1",
-    minimax: "https://api.minimax.chat/v1",
-  };
-
-  // 检测「已添加供应商」及其模型（v0.1.9 改读 provider-catalog.json）
-  // 数据源：~/.hanako/provider-catalog.json（HanaAgent 全局供应商目录，含 base_url/api_key/models/api），
-  // 与表情包等官方生态插件一致；只输出「已配 Key 且 base_url 非空」的供应商下的模型。
-  // 凭据由 getProviderCredentials 服务端回源（前端不接触明文 Key）。
   const postLlmDetect = async (c) => {
-    const detected = [];
-    const catalog = getProviderCatalog(); // { providerId: { base_url, api_key, api, models, ... } }
+    const r = await listHostModels();
 
-    // 宿主 provider:models-by-type 作为「catalog 中该 provider 无 models 时」的补充
-    let providerModels = {};
-    try {
-      const host = await listChatModels(ctx);
-      if (host.ok) {
-        for (const p of (host.providers || [])) providerModels[p.id] = p.models || [];
-      }
-    } catch {}
-
-    const seen = new Set();
-    const pushModel = (pid, m) => {
-      const model = (m && typeof m === "object") ? (m.id || "") : String(m || "");
-      if (!model) return;
-      const k = `${pid}:${model}`;
-      if (seen.has(k)) return;
-      seen.add(k);
-      detected.push({
-        id: `host:${pid}:${model}`,
-        name: model,
-        provider: pid,
-        model,
-        fromHost: true,
-        configured: true,
-        note: `来源: Hanako 全局供应商目录「${pid}」`,
-        needsKey: false,
-        needsBaseUrl: false,
+    if (!r.ok) {
+      // 未授权 / 宿主版本不支持 / list 抛了 —— 把原话递出去。
+      // 不再翻译成「你去加个供应商」：那句会把人引去改一个本来就对的地方。
+      return c.json({
+        ok: true,
+        data: [],
+        source: "host-contract",
+        error: r.error || "",
+        hint: `未检测到可用模型：${r.error || "宿主模型目录不可用"}`,
       });
-    };
-
-    for (const [pid, p] of Object.entries(catalog)) {
-      // 只输出「已配 Key 且 base_url 非空」的供应商（真正可用的"已添加供应商"）
-      if (!p || !p.base_url || !p.api_key) continue;
-      const models = Array.isArray(p.models) ? p.models : [];
-      if (models.length) {
-        for (const m of models) pushModel(pid, m);
-      } else {
-        // catalog 没列模型 → 用宿主 models-by-type 补充
-        for (const m of (providerModels[pid] || [])) pushModel(pid, m);
-      }
     }
 
-    detected.sort((a, b) => (a.provider || "").localeCompare(b.provider || "") || a.model.localeCompare(b.model));
-    return c.json({ ok: true, data: detected });
+    const data = r.models.map((m) => ({
+      id: `host:${m.provider}:${m.id}`,
+      name: m.name || m.id,
+      provider: m.provider,
+      model: m.id,
+      reasoning: !!m.reasoning,
+      // 只是个标记，不是门禁：名字不合宿主旧规则的一律照列、照能选。
+      hostIdOk: m.hostIdOk !== false,
+      fromHost: true,
+      configured: true,
+      note: `来源: 宿主模型目录「${m.provider}」`,
+      needsKey: false,
+      needsBaseUrl: false,
+    }));
+
+    // 空结果要说清是哪一层空：未授权 / 目录为空 / 条目读不出名字，三种修法不同。
+    let hint = "";
+    if (!data.length) {
+      hint = r.total
+        ? `宿主返回了 ${r.total} 个条目，但本层没能从里面读出 provider 与模型名`
+        : "宿主模型目录为空：请先在 Hana 设置 → 模型 里添加供应商与聊天模型";
+    } else if (r.suspect) {
+      // 不删、不藏，也不再标成「可能不收」—— 它们只是走另一扇门。
+      hint = `其中 ${r.suspect} 个由宿主模型目录以外的通路提供（provider 名含中文、空格或斜杠，` +
+        `宿主契约不收，但 bus 能取到凭据）——走的是直连，凭据只在服务端流转`;
+    }
+
+    return c.json({
+      ok: true, data, source: "host-contract+bus",
+      total: r.total, fromContract: r.fromContract, fromBus: r.fromBus,
+      suspect: r.suspect, hint,
+    });
   };
 
-  // 测试 LLM 连接（发一个简单请求验证可用性）
-  // 与总结/翻译一致：key 一律服务端回源（agent config.yaml / 宿主 provider:credentials），
-  // 不接收前端传来的明文 apiKey（key 不应出现在浏览器/localStorage/网络请求中）。
+  // 连接自检：让选中的模型回一个固定短词。
+  // 这一步是唯一能证明「模型真的跑得通」的东西 —— 列表拿到不等于能推理。
   const postLlmTest = async (c) => {
     const body = await c.req.json().catch(() => ({}));
-    let { baseUrl, model, api } = body;
-    let apiKey = "";
-
-    // 优先按 agent 配置引用回源
-    if (body?.agentId) {
-      const ay = await resolveAgentYamlLlm(body.agentId);
-      if (ay && ay.apiKey) {
-        baseUrl = (baseUrl && !String(baseUrl).includes("****")) ? baseUrl : ay.baseUrl;
-        apiKey = ay.apiKey;
-        model = model || ay.model;
-      }
-    }
-    // 否则从宿主解析
-    if (!apiKey) {
-      const cfg = await resolveLlmConfig(ctx, { providerId: body?.providerId, model: body?.model });
-      if (!cfg.ok) return c.json({ ok: false, error: `无法从宿主解析 LLM 配置: ${cfg.error}` });
-      baseUrl = cfg.baseUrl; apiKey = cfg.apiKey; model = cfg.model; api = cfg.api;
-    }
-
-    if (!baseUrl || !model) {
-      return c.json({ ok: false, error: "未找到可用的 LLM 配置：请先在 Hanako 设置中配置聊天供应商，或检测到 agent 配置后再试" });
-    }
-
-    try {
-      // 用后端 llm.mjs 的 chatCompletion 发一条测试消息
-      // 注意签名：chatCompletion(systemOrMessages, user, opts)——第二个参数是 user，
-      // opts 必须放第三位；此前把 opts 放第二位被当成 user，opts 恒空 → baseUrl 丢失 → 永远 notConfigured。
-      const result = await llm.chatCompletion(
-        [{ role: "user", content: "Reply with exactly: OK" }],
-        undefined,
-        { baseUrl, apiKey, model, api, max_tokens: 200 }
-      );
-      return c.json({ ok: true, data: result?.model || model });
-    } catch (e) {
-      return c.json({ ok: false, error: String(e.message || e).slice(0, 300) });
-    }
+    const r = await runAi(llm.pingPrompt(), body?.llmConfig || null, body);
+    if (!r.ok) return c.json({ ok: false, error: r.error, timedOut: r.timedOut });
+    return c.json({ ok: true, data: { reply: r.text, usage: r.usage, requestId: r.requestId } });
   };
 
+  // 这一整块是路由注册表。它差点在 v0.6.13 被连带删掉 —— 当时用注释标题做定界
+  // 去替换 LLM 区，而「依赖安装状态查询」这个标题在文件里不止一处，切点取到了更早
+  // 的那一个，20 条注册语句一起没了。handler 定义还在、路由没了 —— 表现是卡片每个
+  // 面板都报 404，而 node --check 完全正常。恢复取自原仓库 main 分支的同一块。
   app.get("/accounts", getAccounts);
   app.post("/accounts", postAccounts);
   app.get("/folders", getFolders);
@@ -1139,6 +1019,8 @@ export default function (app, ctx) {
       sender: body.sender || "",
       messageId: body.messageId || "",
       accountId: body.accountId || "",
+      // 这封邮件被发现时所在的文件夹；卡片轮询的是用户正在看的 folder，不恒为 INBOX。
+      folder: body.folder || "INBOX",
     });
     return c.json({ ok: res?.ok !== false, method: "native", error: res?.ok === false ? res.error : undefined });
   };

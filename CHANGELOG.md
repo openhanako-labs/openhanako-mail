@@ -1,5 +1,267 @@
 # Changelog
 
+## [0.6.15] — 2026-10-02
+
+### 纠正：0.6.13 删掉的「旧路径」，其实是用户用自己那些模型的唯一通路
+
+0.6.14 改成「不预检、把宿主原话递回去」之后，拿到了真正的报错：
+
+```
+某个中文名的 provider / 其聊天模型: provider must be 1-128 ASCII identifier characters
+```
+
+而另一个事实把话说完了：**同一个模型，宿主自己天天在用它跟用户对话**。
+查宿主 bundle，两边入口与校验力度不同：
+
+| | 取凭据 | provider 名校验 | 中文名 provider |
+|---|---|---|---|
+| **门一** `ctx.models.stream`（`app/models.infer`） | 宿主保管，插件看不到 | `tg()` 要求 `^[A-Za-z0-9_.:-]{1,128}$` | ❌ 拒 |
+| **门二** `ctx.bus` 的 `provider:credentials` + 自己发请求 | bus 回传 baseUrl + apiKey | providerId 只当**查表的键**，不进 HTTP | ✅ 能用 |
+
+同一次调用换个入口结果不同——这是宿主契约自己的不一致。0.6.13 那次「整块删除」
+把门二删了，等于把用户自己加的那批模型关在门外。图库那份被当模板拄的代码只用了门一，
+所以这个限制在生态里一直没被说破。
+
+### 现在的分工（两条腿）
+
+```
+inferText(provider, model, …)
+  ├─ hostAccepts ✓ → 门一 ctx.models.stream   凭据不出宿主，有用量记账
+  ├─ hostAccepts ✗ → 门二 inferDirect()        bus 取凭据 + 受管服务代发 HTTP
+  └─ 门一抱错（非超时）→ 回落门二，并把门一原话带在 gateOneError 里
+```
+
+- 列表两路合流：`ctx.models.list` + `bus provider:models-by-type`；响应里 `fromContract` /
+  `fromBus` 各自报数，`suspect` 改成中性描述（由另一扇门提供）。
+- 下拉里不合 ASCII 规则的不再标「可能不收」，改标「直连」（金色描边）——能用，只是路径不同。
+- 门一失败**超时不回落**：那次请求可能已经发出去了，重试等于两次请求两份钱。
+- 响应带 `via`（contract / bus / bus-after-gate1-fail），走哪条路用户看得见。
+
+### 凭据纪律（门二请回来必然带来的责任）
+
+- `fetchCredentials` **不导出**：key 只能停在取到与拼成请求头那两行之间，
+  `http/ui.js` 从结构上拿不到它。
+- 只走 bus，**不读 `provider-catalog.json`**：那个文件在 AppHost 的 fs 白名单外，
+  读它是 v0.6.12 那个静默空结果的根因，不再留一条死路。
+- 出站借受管服务的 `/http`（AppHost 本身没有网）。0.6.13 删的是 `/provider-catalog`，
+  `/http` 与 `rawRequest` 一直在，所以这次的改动面比预想小。
+- 不回前端、不进日志、错误信息里不带 headers。
+
+能力位回到三条：`app/models.infer` + `app/models.read` + `app/provider.credentials.read`
+（与 bilibili-intake 一致），需重新审批。
+
+自检补 6 条：门二只走 bus、不读 HANA_HOME、不导出取凭据函数、超时不回落、
+列表两路合流、`ui.js` 里调不到 `fetchCredentials`。
+
+> 0.6.13 的「插件侧无从放宽」与 0.6.14 的「宿主可能不收」都不成立，
+> 那两节已就地标为被本版推翻。
+
+## [0.6.14] — 2026-10-02
+
+### 推翻上一版：不合规则的模型只标注，不再从列表里删掉
+
+0.6.13 把模型列表改成只走 `ctx.models` 之后，沿用了图库那条注记里的标识符规则
+（`^[A-Za-z0-9._:-]{1,128}$`），在**列表面就把不合规则的条目删了**。
+
+一句提问拆穿了它：**本来就是用户添加的模型，为什么要过滤？**
+
+错在两处，都挺致命：
+
+1. 供应商名是用户自己在 Hana 设置里起的，宿主 UI 也收了它。本 App 拿一条
+   **来自另一个场景（图库 embedding）的旧实测经验**当律法，相当于替宿主、
+   更替他做了决定。
+2. 后果是静默少了一批模型，其中明眼一看就能用的聊天模型也在里面。
+   而界面只会显示「已过滤 一批」——看起来像解释了，其实是把一个问题
+   包成了另一个更难查的问题（“我配了七个为何只剩三个”）。
+
+改成：
+
+- `sendableModels` 改名 `normalizedModels`，**全部保留**，只打 `hostIdOk` 标记；
+  排序时把名字合规的排前面，但不藏后面的。
+- `inferText` **去掉本地预检**（原来会自己 return 一条「不满足标识符要求」），
+  直接把请求交给宿主：能跑就跑通，跑不通就把宿主的原话递回界面。
+- 前端下拉里不合规的显示为虚线框 + 「名字可能不收」，**仍然可点选**。
+- 状态行只陈述事实：`其中 N 个的 provider 或模型名含中文、空格或斜杠，宿主可能不收 ——
+  仍全部列出，选中后若失败会把宿主的原话显示出来`。
+
+顺手把这条提炼成一句规则写进 README：**遇到「宿主某处会拒、我们能提前避开」的场景，
+默认是告知 + 放行，不是代替选择。**
+
+自检补 2 条：标识符规则不得用于删条目；`inferText` 里不得出现预检 return。
+
+## [0.6.13] — 2026-10-02
+
+### 变更：AI 整块改用宿主模型契约，自建那条路删干净了
+
+用户看着权限页上那个「使用已配置的模型」开关问：**有这个权限不就不用读取了吧。**
+问题问得对，而且比 0.6.12 的修复更深一层——0.6.12 只是把旧路接通，这条路本身不该存在。
+
+`app/models.infer`（界面文案「使用已配置的模型」）的宿主原话是
+「允许此 App 使用 Hana 配置的模型进行推理。**凭据由 Hana 保管**，并记录模型用量」。
+既然凭据、endpoint、API 协议都在宿主侧，插件这边那一整套自建链路就是多余的责任：
+
+| 删掉的东西 | 原本干什么 |
+|---|---|
+| `backend/hana-llm.mjs` | bus 取 baseUrl + apiKey、读 catalog、`selectChatModel` 猜默认供应商 |
+| `backend/net-child.mjs` | 借受管服务代发 LLM 的 HTTP（AppHost 无网） |
+| `llm.mjs` 的 `chatCompletion` / `buildRequest` | 自己分 openai-completions / anthropic-messages 两种协议拼请求 |
+| `resolveAgentYamlLlm` | 读 `agents/<id>/config.yaml` 拿 key |
+| `PROVIDER_PRESETS` | 硬编码 20 家供应商的 Base URL 预设（定义了没人用，本来就是死的） |
+| 服务侧 `/provider-catalog`（0.6.12 刚加的） | 让服务代读 catalog —— 范式没变，一起删 |
+| `HANAKO_LLM_*` 环境变量 | 本地兜底配置，宿主接管后无意义 |
+
+`backend/llm.mjs` 现在只剩三个提示词函数（`summarizePrompt` / `translatePrompt` / `pingPrompt`）——
+只管「问什么」，不管「谁来答」。新增 `lib/model-host.mjs` + `sdk/app-contract/`（取自图库已跑通的实现）。
+
+**能力位随之变化，需要重新审批**：去掉 `app/models.read` 与 `app/provider.credentials.read`，
+新增 `app/models.infer`。
+
+### 实测到的硬限制：模型名送不进宿主
+
+`ctx.models.list()` 这次真的返回了内容（0.6.12 那条「bus 可能不通」的担忧可以销掉），
+但目录里多数条目**过不了宿主的标识符规则** `^[A-Za-z0-9._:-]{1,128}$`：
+
+```
+provider「providerY」/ model「providerY/某模型P」        ← 带斜杠
+provider「provider-cn」/ model「providerX/some/embed-model」  ← 带斜杠
+provider「一个带空格的 provider」                                     ← 带空格
+```
+
+> ⚠ 本节下面关于「剔掉」的做法已被 **0.6.14 推翻** —— 插件侧本来就不该剔。
+> 保留这段是为了记住为什么错：把一条另一个场景的旧实测经验当成了硬约束。
+
+宿主对 provider / model 有一条标识符规则（`^[A-Za-z0-9._:-]{1,128}$`），中文、空格、
+斜杠都可能送不进 `stream`。0.6.13 据此在列表面就把它们剔掉，并在 0.6.14 改回
+全部保留 + 只打标记。`postLlmDetect` 带回的字段也从 `total` / `dropped` / `droppedIds`
+改成 `total` / `suspect` / `suspectIds`——名字从「已丢弃」变成了「可疑」。
+
+### 事故与恢复：定界替换切掉了一整块路由注册
+
+清旧路径时，我用「注释标题」作为区间端点去替换 LLM 区，结果**把 20 条
+`app.get("/accounts", getAccounts)` 之类的路由注册语句一起删了**：
+
+- 表现很迷惑人 —— `node --check` 通过、registrar「正常跑完」、模型列表还照样注册着；
+  只有路由总数从 29 掉到 9，而卡片上每个面板都会 404。
+- 根因：端点标题在文件里不是唯一的切点，替换区间比预想的宽。
+- 恢复：逐行取自原仓库 `main` 分支同一块（不手敲），插回原位并记下为什么在这里留注释。
+- 事后补了 `_dev/diff-members.mjs`：重写前后对比全部顶层成员，确认消失的只有有意删的那几个
+  （`asStr` / `parseSimpleYaml` / `pushModel`，以及 YAML 解析器内部的 `top` 与被删函数内的 `model`）。
+
+**教训**：按标记定界做大段替换，必须事后做一次「成员级 diff」，不能只看语法和断言。
+
+## [0.6.12] — 2026-10-02
+
+### 修复：明明加了一批供应商，却报「未检测到已添加的供应商」
+
+两层原因叠在一起，缺一层都不会浮现：
+
+**一、读不到。** `getProviderCatalog()` 直读 `~/.hanako/provider-catalog.json`（HANA_HOME 根），
+而宿主给 AppHost 的 fs 白名单实测只有三条（从运行中进程的 argv 取到）：
+
+```
+--allow-fs-read=<HANA_HOME>/apps/hanako-mail
+--allow-fs-read=<HANA_HOME>/app-data/hanako-mail
+--allow-fs-read=<bundle>/desktop/src/locales
+```
+
+HANA_HOME 根不在其中。`readFileSync` 被权限模型拒掉，`catch { _catalogCache = {} }` 吞成空 ——
+不报错，只是永远是空。
+
+**二、就算读不到也不该空。** `postLlmDetect` 里 catalog **驱动整个循环**，
+宿主 bus `provider:models-by-type` 只在「catalog 里某供应商没列 models」时当补充。
+catalog 为空 → 循环零次 → bus 给得再多也用不上。
+
+这条读取路径是 v1 时代（插件跑在宿主进程内，什么都能读）留下的，v2 迁移改了进程模型
+却没跟着改它 —— 与上一批里 `app/ui.open-external` 声明了却零调用是同一个模式：
+**声明的能力与实际走的代码路径不一致。**
+
+### 改法
+
+- **宿主 bus 为主路**：`provider:models-by-type` 返回什么就列什么（它只给可用供应商，
+  不需要这层再校 key / base_url）。
+- **目录兜底搬到受管服务**：新增服务侧 `/provider-catalog`。服务跑在 `local-machine` 下，
+  HANA_HOME 在它可读范围内（图库的 embedding 直连也是同一套读法）。AppHost 读不到就转请求。
+  只回 `id / api / models`，**明文 api_key 不跟进程间流动** —— 真凭据仍按 provider 走
+  `provider:credentials` 回源。HANA_HOME 从 DATA_DIR 往上两层反推，不读环境变量。
+- 空结果不再只说「没供应商」：后端算好 `hint`（哪一层空、bus 报了什么、目录可不可读），
+  前端直接显示。否则这句话会把人引去改一个本来就对的地方。
+- `getProviderCatalog` 在 `http/ui.js` 的 import 已删（不再被调用）。
+- 成功时状态行标出 `source`（宿主接口 / 目录兜底），下次一眉就知道走的哪条。
+
+> 待实测：如果 bus 本身困授权未生效而失败，`hint` 会把原因直接写出来，
+> 不再是「你去加个供应商」这种把锅踢给用户的说法。
+
+## [0.6.11] — 2026-10-02
+
+### 修复：邮件里的链接点了会把邮件本身掉
+
+正文 frame 的 `sandbox="allow-popups"`：没有 `allow-top-navigation`，宿主拦不到外链；
+没有 `allow-scripts`，脚本方案也不成立。所以一个没写 `target` 的 `<a>` 会在正文框
+【内部】导航 —— 邮件被目标网页替掉，而那个网页因为沙箱不支持脚本，还是残缺的。
+
+`rewriteLinks()` 把正文里每个 `<a>` 补上 `target="_blank" rel="noopener noreferrer"`，
+走沙箱唯一能用的 `allow-popups` 通道。明写的 `javascript:` / `data:` / `vbscript:`
+顺手摘掉 href（实体编码的写法挡不住，但沙箱本来就没 allow-scripts，这一层是纵深
+防御的第二道，不是唯一那道）。标签名用捕获组原样带回：`<A` 改写后还是 `<A`。
+
+### 修复：多账号下点通知，会拿错账号去取那封邮件
+
+`openDetail(messageId)` 只声明了一个参数，但两个调用点都传了三个
+（`showNotification` 的 toast、`clickPollTick` 的系统通知回跳）——
+`accountId` / `folderId` 被静默丢弃，请求固定用**当前 UI 选中账号**。
+三个账号的人停在 A 收件箱点 B 的新邮件通知，必然加载失败，而且不报错，只显“加载失败”。
+
+现在签名接住三个参数，跳账号时同步侧标并后台补齐那个账号的文件夹列表。
+
+### 修复：folder 从未跟着通知走完全路
+
+新邮件轮询的是用户**当前浏览的文件夹**，不是恒为 `INBOX`；但 toast 重新去取
+`state.folderId`（活 5 秒，够用户把文件夹切走了），而桌面通知的点击记录里
+**根本没有 folder 这个字段**。两边现在一路透传：
+
+```
+卡片 fetchNotifyDesktop(…, folder)
+  → POST /notify  body.folder
+  → _pending_notify/<id>.json  folder
+  → /notify-arm-pipe  meta.folder
+  → notify-click.json  folder
+  → clickPollTick  openDetail(…, d.data.folder || 'INBOX')
+```
+
+实时监听那两条（imap-idle / ws-monitor）直接写目录、不经 `queueNotification`，
+它们没有这个字段 —— 读取侧默认 `INBOX`，与它们的语义一致。
+
+### 新增：纯文本正文里的裸链可点了
+
+以前 `textContent` 直出，验证码、激活链接一概不可点。`linkifyTextInto()` 支持
+`http(s)://` / `www.` / 邮箱地址（后者呯 `mailto:`），中文句读不算进 URL。
+全部用 DOM 节点拼，不拼 `innerHTML` —— 正文是不可信输入，这里不留 XSS 面。
+
+### 外观：正文框不再硬编码白底
+
+`.mail-body-frame { background: #fff }` 是写死的。`srcdoc` 的 body 只铺到内容高度，
+内容短时底部就露白；深色主题纸面是 `#352e25`，反差尤其明显。改为 `transparent`，
+由外层 `.mail-body-wrap` 的 `--paper` 透出，深浅色都对。
+
+### 封面：换最新竖版构图（走 cache-busting）
+
+`face-v2.png` / `ui/face-v2.png` = 1080×1440（3:4）卡片槽构图，标签行反映当前能力
+（多账号 / 实时通知 / 点击直达 / 回复与搜索 / AI 总结）。
+
+以前根目录放新版、`ui/` 下还躺着一张旧的 624×416，而 manifest 只写了 `"face.png"`——
+哪个算数全凭运气。两处现在同一张图，旧的备份到 `OH-Works/backup/hanako-mail/`。
+
+真正让旧图赖着不走的是另一件事：**宿主按路径缓存资产**。同名覆盖完，UI 里还是旧的。
+图库已经栽过一次，当时的解法是改文件名（`icon-v15.png` / `panel-cover-v2.webp`）。
+这里沿用：manifest 指向 `assets/icon-v11.png` 与 `face-v2.png`。
+
+图标本体 `assets/icon.png` 经 MD5 比对已是图标系统 v3 定稿，本次**未重新设计**，
+`icon-v11.png` 是它的同源拷贝 —— 改的是路径，不是像素。
+
+### 自检
+
+`scripts/smoke-load.mjs` 补 8 条源码断言，守住上面每一条不被改回去。
+
 ## [0.6.10] — 2026-09-22
 
 ### 修复：服务进程死掉后，没人拉它起来
@@ -1030,9 +1292,9 @@ ws-monitor,imap-idle,clawemail-backend,agentqq-backend}.mjs`、`http/ui.js`（�
 ## [0.1.9] — 2026-08-02
 
 ### 修复：LLM 凭据读取改为 provider-catalog.json（与官方生态插件一致）
-- **根因**：此前走宿主 `provider:credentials` bus 接口，但该接口在本机拿不到 agnes 等供应商的 baseUrl/apiKey，导致「测试连接」报 `LLM 未配置`（baseUrl 为空）。表情包等官方插件是**直接读 `~/.hanako/provider-catalog.json`**（HanaAgent 全局供应商目录：base_url/api_key/models/api 协议）。
+- **根因**：此前走宿主 `provider:credentials` bus 接口，但该接口在本机拿不到若干自建 provider 的 baseUrl/apiKey，导致「测试连接」报 `LLM 未配置`（baseUrl 为空）。表情包等官方插件是**直接读 `~/.hanako/provider-catalog.json`**（HanaAgent 全局供应商目录：base_url/api_key/models/api 协议）。
 - **`backend/hana-llm.mjs`**：新增 `getProviderCatalog()`（读并缓存 provider-catalog.json，含大小写不敏感匹配）；`getProviderCredentials` 改为「宿主 bus 优先 + catalog 兜底」，正确识别 `api` 协议（anthropic-messages 如 minimax / 讯飞 coding plan）。
-- **`postLlmDetect`**：改读 provider-catalog.json，只输出「已配 Key 且 base_url 非空」的供应商下的模型（catalog 有 models 用 catalog；无则用宿主 models-by-type 补充），并做 provider+model 去重。本机实测：25 个 catalog 供应商 → 6 组 / 9 项（agnes 只 1 个 agnes-2.5-flash，不再 7 个重复）。
+- **`postLlmDetect`**：改读 provider-catalog.json，只输出「已配 Key 且 base_url 非空」的供应商下的模型（catalog 有 models 用 catalog；无则用宿主 models-by-type 补充），并做 provider+model 去重。本机实测：25 个 catalog 供应商 → 6 组 / 9 项（每个 provider 只留一份 某识图模型，不再 7 个重复）。
 - 前端下拉无需改动。
 
 ## [0.1.8] — 2026-08-02

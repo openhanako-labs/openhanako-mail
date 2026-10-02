@@ -129,9 +129,16 @@ Hanako Mail
 │   ├── cred-crypto.mjs     凭据 AES-256-GCM 加解密（统一实现）
 │   ├── blocklist.mjs       黑/白名单
 │   └── common.mjs          公共工具函数
-├── ui/             卡片界面与封面（v1 的 assets/plugin-page-template.html 已迁至此）
+├── ui/             卡片界面（v1 的 assets/plugin-page-template.html 已迁至此）
 │                   ├── mail.html   卡片页面
-│                   └── face.png    卡片中心 / 黑板上的封面（manifest 的 contributes.cards[].face）
+│                   └── face.png    与根目录 face.png 同一张图（见下）
+│
+│   封面读哪张有两层坑：一是 v1 时代它住在 ui/ 下、而 manifest 现在写的是根目录，
+│   解析基准无从自证；二是**宿主按路径缓存资产** —— 同名覆盖完，UI 里还是旧图。
+│   （图库 v0.8.x 已经栽过一次，当时解法是改名：icon-v15.png / panel-cover-v2.webp）
+│   v0.6.11 沿用同一招：manifest 指向 `face-v2.png` 与 `assets/icon-v11.png`，
+│   并在根目录与 ui/ 各放一份同一张图。
+│   换图 = 起新文件名 + 两处都放 + 改 manifest。只覆盖同名文件是无效的。
 ├── lib/            v2 装配层（env / ctx 投影 / 工具与路由注册 / 受管服务句柄 / 通知派发）
 ├── scripts/        自检（smoke-load / smoke-bridge）与图标生成
 ├── helper/         桌面通知（mail-toast.cjs，由 AppHost 拉起）
@@ -314,7 +321,9 @@ AppHost（无 net）                        受管服务（有 net）
 - **正文渲染沙箱**：HTML 正文在 `sandbox` 属性 iframe 中渲染（`srcdoc`），防止邮件内脚本逃逸。
 - **外网图片代理**：正文中的外网 `<img>` / CSS `url()` 改写为同源 `/image-proxy?url=...`，由独立子进程拉取。代理仅接受 http/https，初始 URL 与每次重定向均校验 host（屏蔽私网/回环）、DNS 解析后校验解析 IP（防 rebinding）、限制响应 8MB，规避 SSRF。
 - **不执行任何外部 CLI**（v0.4.0 起）：三个后端全部改为进程内调用 —— ClawEmail 走 SDK 的 HTTP transport、AgentQQ 走官方 REST、IMAP/SMTP 走 `imap`/`nodemailer` 库。用户可控参数从不进入命令行，命令注入面为零。
-- **LLM 凭据不回前端**：总结/翻译/连接测试的 API Key 一律服务端回源（宿主 `provider:credentials` / agent `config.yaml`），浏览器与 localStorage 不接触明文 Key。
+- **LLM 凭据不经本 App**（v0.6.14）：总结/翻译/连接测试全部走宿主契约 `ctx.models`，
+  密钥、endpoint、请求头都留在宿主侧。本 App 既不读 `provider-catalog.json`，
+  也不调 `provider:credentials`，浏览器与 localStorage 更接触不到任何明文 Key。
 
 > 说明：v0.1.0 曾规划「外部收件人需桌面确认后发送」（`identity.mjs` 访客意识 + `_pending_send` 队列），该机制无消费者、队列空转，已在 v0.1.2 移除。当前 send / reply / forward 直接执行；如后续需要「外部收件人确认」，应实现真正的确认消费者。
 
@@ -330,9 +339,9 @@ AppHost（无 net）                        受管服务（有 net）
 | `IMAP_USER` / `IMAP_PASS` | IMAP 账号 / 授权码 | 个人邮箱 |
 | `SMTP_HOST` / `SMTP_PORT` | SMTP 服务器 | 个人邮箱 |
 | `SMTP_USER` / `SMTP_PASS` | SMTP 账号 / 授权码 | 个人邮箱 |
-| `HANAKO_LLM_BASE_URL` | **AI 总结/翻译端点兜底**（OpenAI 兼容 `/v1/chat/completions`，仅在宿主/agent 配置不可用时生效） | 全部 |
-| `HANAKO_LLM_API_KEY` | LLM 鉴权 Token（本地网关可留空） | 全部 |
-| `HANAKO_LLM_MODEL` | LLM 模型名（默认 `gpt-4o-mini`） | 全部 |
+| `HANAKO_LLM_BASE_URL` | ~~AI 端点兜底~~ **v0.6.14 起失效**：模型改走宿主契约 `ctx.models`，本 App 不再自己发请求 | — |
+| `HANAKO_LLM_API_KEY` | ~~同上~~ | — |
+| `HANAKO_LLM_MODEL` | ~~同上~~ | — |
 
 > 域名自动推断：QQ / Gmail / Outlook / 163 / Sina / Aliyun 等常见邮箱的 IMAP/SMTP 主机端口会在未显式配置时自动补全。
 
@@ -343,14 +352,74 @@ AppHost（无 net）                        受管服务（有 net）
 - **总结**：将邮件正文提炼为 3-5 条中文要点，保留关键信息与待办。
 - **翻译**：将正文翻译为目标语言（当前固定 `中文`，可扩展为选项）。
 
-**配置为自动读取，无需手动填写 URL / API Key**（v0.1.1+）：
+**模型与凭据全部由宿主保管，本 App 不读取任何模型配置文件**（v0.6.14）：
 
-1. 插件在「AI 设置」面板打开时（及页面加载时）自动检测本机可用配置；
-2. 检测优先级（真实 Key 一律服务端回源，绝不经过浏览器 / localStorage）：
-   - **Agent 配置**：`~/.hanako/agents/<agent-id>/config.yaml` 中的 `api.api_key` / `api.base_url` / `models.chat`；
-   - **宿主聊天供应商**：经 `ctx.bus` 调用 `provider:models-by-type` + `provider:credentials` 解析 baseUrl + apiKey；
-   - **环境变量兜底**：`HANAKO_LLM_BASE_URL` / `HANAKO_LLM_API_KEY` / `HANAKO_LLM_MODEL`（本地自托管网关调试用）。
-3. 未检测到任何配置时点击按钮返回明确提示，不会静默失败。
+1. 卡片打开时自动拉一次模型列表（`/llm-detect`），设置面板里也能手动重拉；
+2. **唯一数据源是宿主契约 `ctx.models`**（能力位 `app/models.infer`，界面文案「使用已配置的模型」）：
+   `list` 列模型、`stream` 跑总结/翻译/自检、`cancel` 在超时后收尾。
+   provider 的密钥、endpoint、header 全留在宿主里，插件侧看不到也用不到；
+   模型用量由宿主记账。因此 `app/models.read` 与 `app/provider.credentials.read`
+   都已从 manifest 移除。
+3. 列表为空时，状态行会写清是哪一层空（未授权 / 目录空 / 条目读不出名字），
+   不再只说一句「请去设置里添加供应商」。
+
+### 两扇门:为什么一个模型要走两条路
+
+宿主对同一个模型开了两个入口,**校验力度不一样**(v0.6.15 实测):
+
+| | 取凭据 | provider 名的校验 | 中文名 provider |
+|---|---|---|---|
+| **门一** `ctx.models`(能力位 `app/models.infer`) | 宿主保管,插件看不到,还有用量记账 | `tg()` 要求 `^[A-Za-z0-9_.:-]{1,128}$` | ❌ 直接拒 |
+| **门二** `ctx.bus` 的 `provider:credentials`(能力位 `app/provider.credentials.read`) | bus 回传 baseUrl + apiKey | providerId 只当查表的键,不进 HTTP | ✅ 能用 |
+
+所以中文的、带空格的 provider 名这类用户自己起的 provider,
+在门一进不去、在门二能用。只接门一的 App 会默默少一批模型 —— 邮件之前就是这样。
+
+分工:
+
+- `list` **两路合流**:`ctx.models.list` + `bus provider:models-by-type`;
+  响应里 `fromContract` / `fromBus` 各自报数,`suspect` 只作中性描述(由另一扇门提供)。
+- `inferText` 按 `hostAccepts()` 分流:名字合规则走门一(凭据不出宿主),不合规则走门二直连。
+- 门一**抱错也回落一次门二**,但**超时不回落** —— 那次请求可能已经发出去了,
+  重试等于两次请求两份钱。
+- 响应带 `via`(`contract` / `bus` / `bus-after-gate1-fail`),走哪条路用户看得见;
+  下拉里走门二的标「直连」(金色描边),不是警告。
+- `fetchCredentials` **不导出**:key 只能停在「取到」与「拼成请求头」那两行之间,
+  `http/ui.js` 从结构上拿不到它。门二也**不读** `provider-catalog.json` —— 那个文件在
+  AppHost 的 fs 白名单外,见下一节。
+
+> 这条差异是宿主契约自己的不一致(同一个调用换个入口结果不同),不是本 App 在筛用户的东西。
+
+
+### ⚠ 一条容易反复踩的边界：AppHost 读不了 HANA_HOME
+
+宿主给 AppHost 的 fs 白名单（实测自运行进程的 argv）只有三条：
+
+```
+--allow-fs-read=<HANA_HOME>/apps/hanako-mail
+--allow-fs-read=<HANA_HOME>/app-data/hanako-mail
+--allow-fs-read=<bundle>/desktop/src/locales
+```
+
+凡是在 `http/ui.js`（跑在 AppHost）里用 `fs` 直读 HANA_HOME 其它位置的代码，
+**都不会报错，只会静默拿到空**：`readFileSync` 被权限模型拒掉，`catch` 吞一下，
+下游看到的就是「没有数据」。
+
+这条边界曾把 LLM 检测坑得很隐蔽——想读 `provider-catalog.json`、想读
+`agents/<id>/config.yaml`，两处都在白名单外，而且失败长得跟「用户没配供应商」一模一样。
+
+**v0.6.13～0.6.14 把这些读取连同整条旧链路一起删了**（`backend/hana-llm.mjs`、
+`backend/net-child.mjs`、`resolveAgentYamlLlm`、`PROVIDER_PRESETS`、服务侧
+`/provider-catalog`）。改用 `ctx.models` 之后，模型配置根本不需要文件权，
+这个坑也就不存在了。
+
+留着它的价值是提醒后人：要读 HANA_HOME 只有两条正路——走宿主契约，或者把读取
+搬到受管服务（它有 `local-machine` 文件权）。加新路由时先问一句：
+这个文件在不在上面三条白名单里。
+
+> 还有一条容易误判：`C:\Users\<user>\.hanako` 是指向真实 HANA_HOME 的**符号链接**，
+> 所以 `os.homedir()/.hanako/...` 与 `<HANA_HOME>/...` 是同一个文件 ——
+> 换个写法绕不过权限门，只会让人以为已经修好了。
 
 > 说明：
 > - 旧版需要用户在 UI 手填 Base URL / API Key 的表单已移除（明文 Key 不再进浏览器）。
