@@ -1,6 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import { normalizeFolder, defaultFolders, inboxEnvFor } from "../backend/common.mjs";
+import { decryptSensitiveFields } from "../backend/cred-crypto.mjs";
 // 常驻 worker IPC（v0.1.3 起替代每次冷启 node 子进程跑 inbox.mjs）
 import * as workerClient from "../backend/worker-client.mjs";
 
@@ -12,7 +13,8 @@ function resolveAccount(ctx, accountId) {
   const dataDir = path.join(ctx.dataDir, ctx.pluginId);
   const accountsPath = path.join(dataDir, "accounts.json");
   let accounts = [];
-  try { accounts = JSON.parse(fs.readFileSync(accountsPath, "utf-8")); } catch {}
+  // 读入即解密，与 http/ui.js 的 accounts() 对齐——密文透传给后端必然登录失败（issue #2 Bug 2）
+  try { accounts = JSON.parse(fs.readFileSync(accountsPath, "utf-8")).map(decryptSensitiveFields); } catch {}
   const account = accounts.find(a => a.id === accountId);
   if (!account) return null;
   return account;

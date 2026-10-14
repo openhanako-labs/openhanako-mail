@@ -2,6 +2,8 @@
  * 公共工具函数 — 避免 routes/ 和 tools/ 之间的重复代码。
  */
 
+import { decryptField } from "./cred-crypto.mjs";
+
 /**
  * 根据文件夹名称映射类型。
  * @param {string} name - 文件夹名（中英文均可）
@@ -83,21 +85,24 @@ export function htmlToText(html) {
  */
 export function inboxEnvFor(account) {
   const env = {};
-  if (account && account.apiKey) env.CLAWEMAIL_API_KEY = account.apiKey;
+  // 兑底解密：decryptField 对明文幂等（非 ENC: 原样返回）。正常路径 account 已由
+  // http/ui.js accounts() / tools resolveAccount 解密；这一层兑住「谁又直接读了
+  // accounts.json 忘了解密」的情形，env 永远不透传密文（issue #2 Bug 2）。
+  if (account && account.apiKey) env.CLAWEMAIL_API_KEY = decryptField(account.apiKey);
   if (account && account.email) env.CLAWEMAIL_ADDRESS = account.email;
   if (account && account.config) {
     const c = account.config;
     if (c.imapHost) env.IMAP_HOST = c.imapHost;
     if (c.imapPort) env.IMAP_PORT = String(c.imapPort);
     if (c.imapUser) env.IMAP_USER = c.imapUser;
-    if (c.imapPass) env.IMAP_PASS = c.imapPass;
+    if (c.imapPass) env.IMAP_PASS = decryptField(c.imapPass);
     if (c.smtpHost) env.SMTP_HOST = c.smtpHost;
     if (c.smtpPort) env.SMTP_PORT = String(c.smtpPort);
     if (c.smtpUser) env.SMTP_USER = c.smtpUser;
-    if (c.smtpPass) env.SMTP_PASS = c.smtpPass;
+    if (c.smtpPass) env.SMTP_PASS = decryptField(c.smtpPass);
     // AgentQQ：OAuth 令牌经环境变量透传（与其它后端一致）
-    if (c.agentqqAccessToken) env.AGENTQQ_ACCESS_TOKEN = c.agentqqAccessToken;
-    if (c.agentqqRefreshToken) env.AGENTQQ_REFRESH_TOKEN = c.agentqqRefreshToken;
+    if (c.agentqqAccessToken) env.AGENTQQ_ACCESS_TOKEN = decryptField(c.agentqqAccessToken);
+    if (c.agentqqRefreshToken) env.AGENTQQ_REFRESH_TOKEN = decryptField(c.agentqqRefreshToken);
     if (c.agentqqExpiresAt) env.AGENTQQ_EXPIRES_AT = String(c.agentqqExpiresAt);
     if (c.agentqqAliasId) env.AGENTQQ_ALIAS_ID = c.agentqqAliasId;
   }
