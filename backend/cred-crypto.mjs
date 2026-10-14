@@ -141,3 +141,23 @@ export function decryptSensitiveFields(account) {
   }
   return out;
 }
+
+/**
+ * 脱敏：返回 account 的浅拷贝，敏感字段非空时以 "****" 替代。
+ * 用于工具输出与日志——明文凭据不得进入模型上下文（issue #2 Bug 3）。
+ * 字段清单与 encrypt/decryptSensitiveFields 同源（apiKey + SENSITIVE_CONFIG_KEYS），
+ * 新增凭据字段只改 SENSITIVE_CONFIG_KEYS 一处。
+ */
+export function redactAccount(account) {
+  if (!account || typeof account !== "object") return account;
+  const out = { ...account };
+  if (out.apiKey) out.apiKey = "****";
+  if (out.config && typeof out.config === "object") {
+    const cfg = { ...out.config };
+    for (const k of SENSITIVE_CONFIG_KEYS) {
+      if (cfg[k]) cfg[k] = "****";
+    }
+    out.config = cfg;
+  }
+  return out;
+}

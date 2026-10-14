@@ -1,6 +1,6 @@
 import fs from "node:fs";
 import path from "node:path";
-import { setCryptoDataDir, encryptSensitiveFields, decryptSensitiveFields } from "../backend/cred-crypto.mjs";
+import { setCryptoDataDir, encryptSensitiveFields, decryptSensitiveFields, redactAccount } from "../backend/cred-crypto.mjs";
 
 export const name = "mail_accounts";
 export const description = "邮件账号管理：列表/创建/删除账号";
@@ -36,7 +36,8 @@ export async function execute(input, ctx) {
   }
 
   if (action === "list") {
-    return { ok: true, data: readAccounts() };
+    // 输出脱敏：明文凭据不得进入模型上下文与日志（issue #2 Bug 3）
+    return { ok: true, data: readAccounts().map(redactAccount) };
   }
 
   if (action === "create") {
@@ -46,14 +47,14 @@ export async function execute(input, ctx) {
     const account = { id: Date.now().toString(), name, email, provider: provider || "imap", createdAt: Date.now(), updatedAt: Date.now() };
     list.push(account);
     writeAccounts(list);
-    return { ok: true, data: list };
+    return { ok: true, data: list.map(redactAccount) };
   }
 
   if (action === "delete") {
     const { id } = input || {};
     const list = readAccounts().filter((a) => a.id !== id);
     writeAccounts(list);
-    return { ok: true, data: list };
+    return { ok: true, data: list.map(redactAccount) };
   }
 
   return { ok: false, error: "unknown action" };

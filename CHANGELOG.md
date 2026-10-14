@@ -1,5 +1,44 @@
 # Changelog
 
+## [0.6.16] — 2026-10-14
+
+### 修复：工具路径四连缺陷（issue #2，报告：LBRANDSk）
+
+报告者把 v0.6.15 拆到了源码级：工具结果不回显、密文当密码传、凭据明文泄露、
+全新安装路由崩溃，每条都有根因与证据。本版在 Windows（正式通道，同 0.6.15）
+上逐条核对源码后照单全收。
+
+1. **工具结果不回显**（`lib/register-tools.mjs`，Bug 1）——v2 宿主的工具契约是
+   MCP 形状 `{ content: [{ type: "text", text }] }`，适配层却把 v1 模块的裸对象
+   `{ ok, data }` 原样透传，没有 `content` 字段，宿主渲染成空。返回值现于注册层
+   就地包装（工具模块仍只返回业务对象），`isError` 跟随 `r.ok === false`。
+
+2. **密文当密码传给后端**（`tools/{messages,folders,send,sync}` + `backend/common.mjs`，Bug 2）——
+   四个工具直接 `JSON.parse(accounts.json)`，不像 `http/ui.js` 的 `accounts()`
+   那样过 `decryptSensitiveFields`，`ENC:...` 密文原样进 `IMAP_PASS`，ImapFlow
+   登录必败，真实原因又被 imapflow 吞成通用 `Command failed`——这正是
+   「界面能同步、工具报错」的由来。现在四个工具读入即解密（与界面路径对齐），
+   `inboxEnvFor` 再加一层 `decryptField` 兑底（对明文幂等）——以后谁再忘了解密，
+   env 也拿不到密文。
+
+3. **明文凭据泄露**（`tools/accounts.js` + `cred-crypto.mjs`，Bug 3）——
+   `mail_accounts` 的 list/create/delete 直接返回已解密的完整账号对象，
+   授权码会进模型上下文与日志。`cred-crypto.mjs` 新增 `redactAccount()`
+   （字段清单与加解密同源，`SENSITIVE_CONFIG_KEYS` 一处维护），
+   三个 action 的返回统一过脱敏（`****`）。
+
+4. **全新安装路由崩溃**（`http/ui.js`，Bug 4）——账号目录候选循环里的
+   `fs.existsSync` 撞到 `--allow-fs-read` 白名单外的路径时**拋错而非返回
+   false**（已在本机用 Node 权限模型复现：`ERR_ACCESS_DENIED`），整个路由
+   注册被打断，卡片报「后端未就绪：Not Found」。只有干净安装（尚无
+   accounts.json 命中白名单内候选，循环会推进到 legacy 目录）才触发，
+   所以开发机一直没暴露。禁读路径现按「不存在」处理，走完候选列表。
+
+> 报告者环境为 macOS arm64 beta；报告中的 Bug 2 证据链（`IMAP_PASS` 长度
+> 密文 94 / 明文 16）与 Bug 4 的 `--allow-fs-read` 行为本机均已独立复现。
+> 报告结尾「统一的 MCP 包装 + 脱敏」的方向采纳：包装集中在注册层，
+> 脱敏集中在 `cred-crypto.mjs`，工具模块各自不碰。
+
 ## [0.6.15] — 2026-10-02
 
 ### 纠正：0.6.13 删掉的「旧路径」，其实是用户用自己那些模型的唯一通路

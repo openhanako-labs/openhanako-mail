@@ -294,7 +294,13 @@ export default function (app, ctx) {
   for (const d of _acctCandidates) {
     if (!d || _acctSeen.has(d)) continue;
     _acctSeen.add(d);
-    if (fs.existsSync(path.join(d, "accounts.json"))) {
+    // Node 权限模型下，existsSync 撞到 --allow-fs-read 白名单外的路径会拋错
+    // （不是返回 false）——全新安装时白名单内候选全 miss，循环推进到 legacy
+    // 目录一炸，整个路由注册跟着断，卡片报「后端未就绪」（issue #2 Bug 4）。
+    // 禁读路径按「不存在」处理，继续走完候选列表。
+    let _hit = false;
+    try { _hit = fs.existsSync(path.join(d, "accounts.json")); } catch { _hit = false; }
+    if (_hit) {
       _accountsDir = d;
       break;
     }
