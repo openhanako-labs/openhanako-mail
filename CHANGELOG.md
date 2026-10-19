@@ -1,5 +1,35 @@
 # Changelog
 
+## [0.6.17] — 2026-10-19
+
+### 安全加固：受管服务入口鉴权（PR #95 静态审查闭环）
+
+审查指出 runtime/service.mjs 的回环入口无调用方密钥、无 Host/Origin 校验，
+readBody 不验 Content-Type，且 /migrate、/cli、/http 三处把落盘/出站位置交给请求参数。
+本次按「统一设计：五道闸」落地，缺口逐一闭合：
+
+1. **G1 调用方密钥**：AppHost（lib/runtime-host.mjs doStart）每次拉起服务前生成
+   `randomBytes(32).hex`，经 `argv[5]` 传入并在 `callService` 的 fetch 头注入
+   `X-Hanako-Service-Key`；服务侧入口常时比较（timingSafeEqual）。缺 token 时
+   fail-closed，全部请求 403 并在 service.log 写明。
+2. **G2 Host/浏览器指纹**：`handle()` 最顶端（/health 之前）插闸 —— Host 必须
+   是 `127.0.0.1:<PORT>` 或 `localhost:<PORT>`；带 `Origin` 或 `Sec-Fetch-Site`
+   （非 none）的请求一律 403。注意不能「见 Sec-Fetch-* 就拒」：实测 Node v24+ 的
+   undici fetch 会主动带 `Sec-Fetch-Mode`，宿主桥会因此被误杀——判别特征收紧到
+   浏览器独有的 Origin 头与 Sec-Fetch-Site。
+3. **G4 请求格式**：`readBody` 校验 `Content-Type: application/json`（允许
+   `;charset=` 后缀，否则 415），解析结果须为非数组对象（否则 400）。
+4. **G5 落盘/出站参数绑定**：
+   · `/migrate` 删掉 `body.from`/`body.to`，固定 `migrate(LEGACY_DIR, DATA_DIR)`；
+   · `/cli` 的 `body.env` 收紧为 15 个白名单键，其余键回 400 `env key not allowed`；
+   · `/http` 出站加 `<DATA_DIR>/outbound-allowlist.json` 命中校验（文件缺失 fail-closed
+     拒绝），`new URL(body.url).origin` 须命中且为 https（loopback 本地 provider
+     允许 http），命中后复用 proxyFetch 的 DNS resolve + isBlockedHost 防 rebinding。
+5. `/proxy` 已有 resolve 级 SSRF 防护不动，仅被 token 门覆盖；其余路由不变，token 门覆盖。
+
+> 验收：缺失/错误密钥、陌生来源（Origin/指纹头）、不合规 Content-Type 与越界 env 均
+> 不会触发邮件操作、出站或文件复制；带密钥的正常 AppHost 客户端仍可工作。
+
 ## [0.6.16] — 2026-10-14
 
 ### 修复：工具路径四连缺陷（issue #2，报告：LBRANDSk）

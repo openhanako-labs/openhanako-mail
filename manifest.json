@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "hanako-mail",
   "name": "Hanako Mail",
-  "version": "0.6.16",
+  "version": "0.6.17",
   "description": "多邮箱聚合管理：ClawEmail / AgentQQ 官方 API + 个人邮箱 IMAP/SMTP，支持多账号、文件夹、已读未读、回复、搜索、AI 总结翻译与实时收件通知。",
   "minAppVersion": "0.946.2",
   "entry": "index.js",

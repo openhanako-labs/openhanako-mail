@@ -31,7 +31,7 @@ import http from "node:http";
 import https from "node:https";
 import net from "node:net";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { randomBytes } from "node:crypto";
+import { randomBytes, timingSafeEqual } from "node:crypto";
 import { startDeviceFlow, waitForAuthorization } from "../backend/agentqq-auth.mjs";
 import { spawnSync, execFile } from "node:child_process";
 import { decryptSensitiveFields, encryptSensitiveFields } from "../backend/cred-crypto.mjs";
@@ -49,6 +49,13 @@ const LEGACY_DIR = process.argv[3] || "";
 process.env.HANAKO_PLUGIN_DATA = DATA_DIR;
 
 const PORT = Number(process.argv[4]) || 43179;
+
+// 调用方密钥：由 AppHost（lib/runtime-host.mjs doStart）每次拉起服务前生成
+// randomBytes(32).hex，经 argv 第 5 位传入。受管运行时的 env 是白名单，
+// token 不能走环境变量，只能走现行参数通道（dataDir / port 都这么传）。
+// 入口对**每个请求**做 timingSafeEqual 常时比较；缺失时 fail-closed
+// （全部请求 403），见 handle() 顶部 enforceServiceAuth()。
+const AUTH_TOKEN = process.argv[5] || "";
 
 // 诊断缓存：服务能不能 spawn、看不看得见 npm（依赖自愈的前提）。
 // 在 probeSpawn 里算一次，供 /health 报告 —— 不每次现查。
@@ -291,6 +298,47 @@ function rawRequest({ url, method = "POST", headers = {}, body = "", timeoutMs =
     req.on("timeout", () => { req.destroy(); resolve({ ok: false, error: "request timeout" }); });
     if (payload) req.write(payload);
     req.end();
+  });
+}
+
+// /http 出站 allowlist 校验：AppHost 在 provider 设置保存时把 [{ origin, name }] 写入
+// <DATA_DIR>/outbound-allowlist.json。未命中（或文件不存在 fail-closed）一律拒绝。
+// 命中后复用 proxyFetch 的 DNS resolve + isBlockedHost 逻辑防 rebinding。
+async function rawRequestAllowed({ url } = {}) {
+  if (!url) return { ok: false, error: "missing url" };
+  let parsed;
+  try { parsed = new URL(url); } catch { return { ok: false, error: "invalid url" }; }
+  const origin = parsed.origin;
+  // 回环/私网上的本地 provider 允许 http（需用户 allowlist 明确登记才可达）；
+  // 公网端点只允许 https。isBlockedHost 的实际语义是「回环或私网段」，非仅回环。
+  const isLocalOrPrivate = isBlockedHost(parsed.hostname);
+  if (parsed.protocol !== "https:" && !(isLocalOrPrivate && parsed.protocol === "http:")) {
+    return { ok: false, error: "only https allowed (loopback http permitted)" };
+  }
+  let allowlist;
+  try {
+    allowlist = JSON.parse(fs.readFileSync(path.join(DATA_DIR, "outbound-allowlist.json"), "utf-8"));
+  } catch {
+    // G5c fail-closed：文件不存在/损坏 → 拒绝一切出站。
+    log("WARN", "出站代理拒绝：allowlist 文件缺失或无法解析（fail-closed）");
+    return { ok: false, error: "outbound allowlist not configured" };
+  }
+  const hit = (Array.isArray(allowlist) ? allowlist : []).some(
+    (e) => e && (e.origin === origin || e.origin === parsed.host)
+  );
+  if (!hit) return { ok: false, error: "origin not in outbound allowlist" };
+  // 命中后仍需防 rebinding：先校验解析出的 IP 不是私网/回环（loopback 本地 provider 除外）。
+  if (!isLocalOrPrivate) {
+    try { await verifyResolved(parsed.hostname); } catch (e) { return { ok: false, error: e.message }; }
+  }
+  // 鉴权只校验 URL；method/headers/body/timeout 原样透传 —— LLM 出站的凭据在 headers、
+  // 请求体在 body，这是 /http 的本职，不能被鉴权层吞掉。
+  return rawRequest({
+    url,
+    method: body.method || "POST",
+    headers: body.headers || {},
+    body: body.body || "",
+    timeoutMs: body.timeoutMs || 120000,
   });
 }
 
@@ -723,7 +771,56 @@ async function startListeners() {
 }
 
 // ── HTTP 服务 ──
+
+// G1+G2 闸门：放在 route 分发**之前**，任一不满足直接短路，不触达任何业务代码。
+// 合法调用方只有 AppHost（lib/runtime-host.mjs），它既带 X-Hanako-Service-Key，
+// 又经 ctx.runtime.fetch 直连 127.0.0.1（undici 不带浏览器指纹头）。
+function enforceServiceAuth(req, res) {
+  // G2-1：Host 必须是 127.0.0.1:<PORT> 或 localhost:<PORT>。
+  // 先把实际 Host 值记进 service.log（宿主桥的 Host 形态需实测），再决定放行/拒绝。
+  const host = req.headers.host || "";
+  const okHost = host === `127.0.0.1:${PORT}` || host === `localhost:${PORT}`;
+  if (!okHost) {
+    log("WARN", "服务鉴权拒绝：Host 不在白名单", { host });
+    return send(res, 403, { ok: false, error: "unauthorized" });
+  }
+  // G2-2/3：浏览器跨站指纹一律 403。不能「见 Sec-Fetch-* 就拒」——新版 undici/Node
+  // 的服务端 fetch 也带 sec-fetch-mode（实测 v24 即如此），会误杀宿主桥；
+  // 浏览器攻击的判别特征是 Origin 头与 Sec-Fetch-Site（浏览器恒带 site，服务端不带）。
+  if (req.headers.origin
+      || (req.headers["sec-fetch-site"] && req.headers["sec-fetch-site"] !== "none")) {
+    log("WARN", "服务鉴权拒绝：检出浏览器跨站指纹", {
+      origin: req.headers.origin || null,
+      secFetchSite: req.headers["sec-fetch-site"] || null,
+      secFetchMode: req.headers["sec-fetch-mode"] || null,
+    });
+    return send(res, 403, { ok: false, error: "unauthorized" });
+  }
+  // G1：调用方密钥。缺失（旧版 AppHost 配新版服务）时 fail-closed —— 全部 403。
+  if (!AUTH_TOKEN) {
+    log("WARN", "服务鉴权拒绝：未收到调用方密钥（AUTH_TOKEN 为空）");
+    return send(res, 403, { ok: false, error: "unauthorized" });
+  }
+  const provided = req.headers["x-hanako-service-key"] || "";
+  const a = Buffer.from(provided);
+  const b = Buffer.from(AUTH_TOKEN);
+  // 长度不等时 timingSafeEqual 会抛，先判长度再常时比较；不区分缺失/错误。
+  if (a.length !== b.length || !timingSafeEqual(a, b)) {
+    log("WARN", "服务鉴权拒绝：密钥不匹配");
+    return send(res, 403, { ok: false, error: "unauthorized" });
+  }
+  return null; // 通过
+}
+
 function readBody(req) {
+  // G4-1：Content-Type 必须为 application/json（允许 ;charset= 后缀），否则 415。
+  // 这堵死「跨站 no-cors 简单请求只能发 text/plain」被当 JSON 操作的路径
+  // （审查原话：CORS 不能替代鉴权）。
+  const ct = String(req.headers["content-type"] || "").toLowerCase().split(";")[0].trim();
+  // 缺失 Content-Type 同样拒绝（与图库侧口径一致）：合法调用方（宿主桥）恒带 application/json。
+  if (ct !== "application/json") {
+    return Promise.resolve({ __unauthorizedContentType: true });
+  }
   return new Promise((resolve) => {
     const chunks = [];
     let total = 0;
@@ -735,7 +832,14 @@ function readBody(req) {
     req.on("end", () => {
       const s = Buffer.concat(chunks).toString("utf-8");
       if (!s) { resolve({}); return; }
-      try { resolve(JSON.parse(s)); } catch { resolve(null); }
+      let parsed;
+      try { parsed = JSON.parse(s); } catch { resolve(null); return; }
+      // G4-2：解析结果必须是**非数组对象**，否则 400（数组/原始值不是合法业务参数）。
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        resolve({ __invalidBodyShape: true });
+        return;
+      }
+      resolve(parsed);
     });
   });
 }
@@ -747,6 +851,10 @@ function send(res, code, obj) {
 }
 
 async function handle(req, res) {
+  // 五道闸最顶端：G1+G2 覆盖**所有**请求（含 /health）。
+  const blocked = enforceServiceAuth(req, res);
+  if (blocked) return blocked;
+
   const url = new URL(req.url, "http://127.0.0.1");
   const route = url.pathname;
 
@@ -768,13 +876,30 @@ async function handle(req, res) {
 
   if (req.method !== "POST") return send(res, 405, { ok: false, error: "method not allowed" });
   const body = await readBody(req);
+  // G4 三类不合规请求，优先于业务处理短路返回：
+  if (body && body.__unauthorizedContentType) return send(res, 415, { ok: false, error: "unsupported media type" });
+  if (body && body.__invalidBodyShape) return send(res, 400, { ok: false, error: "body must be a JSON object" });
   if (body === null) return send(res, 413, { ok: false, error: "body too large or invalid json" });
 
   try {
     if (route === "/migrate") {
-      return send(res, 200, migrate(body.from || LEGACY_DIR, body.to || DATA_DIR));
+      // G5a：这条路由只服务一条迁移路径（v1 目录 LEGACY_DIR → 现数据目录 DATA_DIR），
+      // 不再接受 body.from/body.to —— 那是多余的攻击面，可把复制目标指向任意位置。
+      return send(res, 200, migrate(LEGACY_DIR, DATA_DIR));
     }
     if (route === "/cli") {
+      // G5b：env 白名单先于业务可用性检查——请求格式不合规直接 400，
+      // 后端未加载（503）不能成为绕过参数校验的入口。
+      // 实际消费方就这些，全部列死，杜绝任意覆盖进程环境（审查点名 PATH / NODE_OPTIONS 等）。
+      const ALLOWED_ENV_KEYS = new Set([
+        "AGENTQQ_ACCESS_TOKEN", "AGENTQQ_REFRESH_TOKEN", "AGENTQQ_EXPIRES_AT",
+        "AGENTQQ_ALIAS_ID", "AGENTQQ_ACCOUNT_ID", "CLAWEMAIL_API_KEY", "CLAWEMAIL_ADDRESS",
+        "IMAP_USER", "IMAP_PASS", "IMAP_HOST", "IMAP_PORT",
+        "SMTP_USER", "SMTP_PASS", "SMTP_HOST", "SMTP_PORT",
+      ]);
+      for (const k of Object.keys(body.env || {})) {
+        if (!ALLOWED_ENV_KEYS.has(k)) return send(res, 400, { ok: false, error: "env key not allowed" });
+      }
       if (!inbox) return send(res, 503, { ok: false, error: "backend not loaded" });
       const handler = inbox.COMMANDS?.[body.cmd];
       if (!handler) return send(res, 400, { ok: false, error: `unknown command: ${body.cmd}` });
@@ -785,7 +910,7 @@ async function handle(req, res) {
       const data = await handler(body.args || []);
       return send(res, 200, { ok: true, data });
     }
-    if (route === "/http") return send(res, 200, await rawRequest(body));
+    if (route === "/http") return send(res, 200, await rawRequestAllowed(body));
     if (route === "/proxy") return send(res, 200, await proxyFetch(body.url));
     if (route === "/notify") return send(res, 200, queueNotification(body));
     if (route === "/pending-notify") return send(res, 200, drainNotifications(body.limit));
