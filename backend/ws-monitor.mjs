@@ -147,11 +147,40 @@ function saveMail(accountId, mail) {
 
 function loadAccounts() {
   const accountsPath = path.join(getDataDir(), "accounts.json");
+  // 同 issue #4：裸 catch 会把四种失败压成同一个空数组，日志里看不出原因。
+  let raw;
   try {
-    setCryptoDataDir(getDataDir());
-    const raw = JSON.parse(fs.readFileSync(accountsPath, "utf-8"));
-    return (Array.isArray(raw) ? raw : []).map(decryptSensitiveFields);
-  } catch { return []; }
+    raw = JSON.parse(fs.readFileSync(accountsPath, "utf-8"));
+  } catch (e) {
+    if (e && e.code === "ENOENT") {
+      log("WARN", "accounts.json 不存在，无账号可监控", { path: accountsPath });
+    } else {
+      log("ERROR", "accounts.json 读取/解析失败", { path: accountsPath, err: e.message });
+    }
+    return [];
+  }
+
+  const list = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const item of list) {
+    try {
+      setCryptoDataDir(getDataDir());
+      const acc = decryptSensitiveFields(item);
+      if (acc && Array.isArray(acc._undecryptable) && acc._undecryptable.length) {
+        log("ERROR", "账号凭据无法解密（可能是换过机器、或系统用户名不可用）", {
+          email: acc.config && acc.config.user,
+          fields: acc._undecryptable,
+        });
+      }
+      out.push(acc);
+    } catch (e) {
+      log("ERROR", "账号凭据解密抛错，跳过该账号", {
+        email: item && item.config && item.config.user,
+        err: e.message,
+      });
+    }
+  }
+  return out;
 }
 
 function loadProcessed(accountId) {

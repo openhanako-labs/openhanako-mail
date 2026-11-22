@@ -88,24 +88,37 @@ export function inboxEnvFor(account) {
   // 兑底解密：decryptField 对明文幂等（非 ENC: 原样返回）。正常路径 account 已由
   // http/ui.js accounts() / tools resolveAccount 解密；这一层兑住「谁又直接读了
   // accounts.json 忘了解密」的情形，env 永远不透传密文（issue #2 Bug 2）。
-  if (account && account.apiKey) env.CLAWEMAIL_API_KEY = decryptField(account.apiKey);
+  //
+  // ⚠️ issue #4：decryptField 现在对「是密文但解不开」返 null。不能直接赋给 env ——
+  //   Node 会把 null 写成字符串 "null"，子进程拿着 "null" 去登录会更莫名其妙。
+  //   解不开时既不给 env，也用 HANAKO_MAIL_UNDECRYPTABLE 标出来。
+  const needsFix = [];
+  const putSecret = (envKey, token) => {
+    if (!token) return;
+    const v = decryptField(token);
+    if (v === null) { needsFix.push(envKey); return; }
+    env[envKey] = v;
+  };
+
+  if (account && account.apiKey) putSecret("CLAWEMAIL_API_KEY", account.apiKey);
   if (account && account.email) env.CLAWEMAIL_ADDRESS = account.email;
   if (account && account.config) {
     const c = account.config;
     if (c.imapHost) env.IMAP_HOST = c.imapHost;
     if (c.imapPort) env.IMAP_PORT = String(c.imapPort);
     if (c.imapUser) env.IMAP_USER = c.imapUser;
-    if (c.imapPass) env.IMAP_PASS = decryptField(c.imapPass);
+    putSecret("IMAP_PASS", c.imapPass);
     if (c.smtpHost) env.SMTP_HOST = c.smtpHost;
     if (c.smtpPort) env.SMTP_PORT = String(c.smtpPort);
     if (c.smtpUser) env.SMTP_USER = c.smtpUser;
-    if (c.smtpPass) env.SMTP_PASS = decryptField(c.smtpPass);
+    putSecret("SMTP_PASS", c.smtpPass);
     // AgentQQ：OAuth 令牌经环境变量透传（与其它后端一致）
-    if (c.agentqqAccessToken) env.AGENTQQ_ACCESS_TOKEN = decryptField(c.agentqqAccessToken);
-    if (c.agentqqRefreshToken) env.AGENTQQ_REFRESH_TOKEN = decryptField(c.agentqqRefreshToken);
+    putSecret("AGENTQQ_ACCESS_TOKEN", c.agentqqAccessToken);
+    putSecret("AGENTQQ_REFRESH_TOKEN", c.agentqqRefreshToken);
     if (c.agentqqExpiresAt) env.AGENTQQ_EXPIRES_AT = String(c.agentqqExpiresAt);
     if (c.agentqqAliasId) env.AGENTQQ_ALIAS_ID = c.agentqqAliasId;
   }
+  if (needsFix.length) env.HANAKO_MAIL_UNDECRYPTABLE = needsFix.join(",");
   // 刷新出的新令牌要能写回该账号，所以后端得知道自己在给谁干活
   if (account && account.id != null) env.AGENTQQ_ACCOUNT_ID = String(account.id);
   return env;

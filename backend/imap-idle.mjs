@@ -54,11 +54,50 @@ function log(level, msg, data) {
 
 function loadAccounts() {
   const accountsPath = path.join(DATA_DIR, "accounts.json");
+  // ⚠️ issue #4：旧写法是裸 `catch { return [] }`，把
+  //   「文件不存在」「JSON 坏了」「凭据解不开」「真没账号」压成同一个空数组，
+  //   日志里就看不出到底是哪一种——而「凭据解不开」恰恰是最需要看见的那种。
+  let raw;
   try {
-    setCryptoDataDir(DATA_DIR);
-    const raw = JSON.parse(fs.readFileSync(accountsPath, "utf-8"));
-    return (Array.isArray(raw) ? raw : []).map(decryptSensitiveFields);
-  } catch { return []; }
+    raw = JSON.parse(fs.readFileSync(accountsPath, "utf-8"));
+  } catch (e) {
+    if (e && e.code === "ENOENT") {
+      log("WARN", "accounts.json 不存在，无账号可监听", { path: accountsPath });
+    } else {
+      log("ERROR", "accounts.json 读取/解析失败", { path: accountsPath, err: e.message });
+    }
+    return [];
+  }
+
+  const list = Array.isArray(raw) ? raw : [];
+  if (!list.length) {
+    log("WARN", "accounts.json 里没有账号条目");
+    return [];
+  }
+
+  const out = [];
+  for (const item of list) {
+    let acc;
+    try {
+      setCryptoDataDir(DATA_DIR);
+      acc = decryptSensitiveFields(item);
+    } catch (e) {
+      // 解密链本身抛错（例如密钥派生失败）——必须留声，不能静默吞掉。
+      log("ERROR", "账号凭据解密抛错，跳过该账号", {
+        email: item && item.config && item.config.user,
+        err: e.message,
+      });
+      continue;
+    }
+    if (acc && Array.isArray(acc._undecryptable) && acc._undecryptable.length) {
+      log("ERROR", "账号凭据无法解密（可能是换过机器、或系统用户名不可用）", {
+        email: acc.config && acc.config.user,
+        fields: acc._undecryptable,
+      });
+    }
+    out.push(acc);
+  }
+  return out;
 }
 
 // ── 已处理集合（防重复通知/缓存） ──
@@ -245,7 +284,11 @@ async function watchAccount(account) {
     } catch (e) {
       log("WARN", "连接失败", { email, err: e.message });
       try { if (next) next.close(); } catch {}
-      imapEnd(next);
+      // ⚠️ issue #4：这里必须传 null，不能传 next。
+      //   imapEnd 第一行是 `if (which && client !== which) return;`，
+      //   而首连失败时 client 还是 null —— 传 next 会命中 early return，
+      //   重连定时器永远排不上，账号就永久静默失联。
+      imapEnd(null);
     }
   };
 
