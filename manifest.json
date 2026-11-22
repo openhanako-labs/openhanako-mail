@@ -2,7 +2,7 @@
   "manifestVersion": 2,
   "id": "hanako-mail",
   "name": "Hanako Mail",
-  "version": "0.6.18",
+  "version": "0.6.19",
   "description": "多邮箱聚合：IMAP/SMTP、ClawEmail，AI 总结与实时通知。",
   "minAppVersion": "0.946.2",
   "entry": "index.js",

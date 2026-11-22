@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.6.19] — 2026-11-22
+
+### 修复：沙盒环境凭据密钥推不出、实时收件监听静默失效（#4）
+
+issue #4 报的是一条链，本次五处兜底一起改：
+
+1. **主密钥不再参与用户名**：改为 `scrypt("hanako-mail-install:" + per-install 盐)`。
+   macOS 受管运行时沙盒里 `uv_os_get_passwd` 返 ENOENT，`os.userInfo()` 直接抛，
+   旧写法用 `用户名 + 盐` 派生，于是一个取用户名失败就把整条解密链拖垮。
+   解密保留两条旧候选（用户名+盐、用户名+硬编码盐），**既有 accounts.json 照旧能读**。
+2. **候选密钥逐个包 try**：旧写法 `for (const key of [currentKey(), legacyKey()])`
+   在循环头先求值数组，`try` 只盖住解密本身——第一个候选一抛就全完。
+3. **`decryptField` 对「是密文但解不开」返回 null**：旧行为原样返回，
+   于是 `ENC:1e...` 会被当成密码发给服务器，日志里只留一句
+   `NO LOGIN Login error or password error`。现在上层能明确报「这条凭据无法解密」，
+   并在 `_undecryptable` 里标出字段名。
+4. **首连失败改 `imapEnd(null)`**：旧写法传 `next`，撞上 `client !== which` 的
+   early return（首连时 client 还是 null），重连定时器永远排不上，账号永久静默失联。
+5. **`loadAccounts` 的裸 catch 拆开记录**：文件不存在 / 解析失败 / 解密失败分别报，
+   不再压成同一个空数组（这正是本 issue 最难查的地方）。imap-idle 与 ws-monitor 两处。
+6. `common.mjs` 透传 env 时跳过 null（`env.X = null` 会变成字符串 `"null"`），
+   解不开的字段改标 `HANAKO_MAIL_UNDECRYPTABLE`。
+
+新增回归测试 `tests/cred-crypto-issue4.mjs`（15 项）：覆盖新主密钥往返、
+两种旧格式兼容、坏密文返 null、`_undecryptable` 标记，以及**模拟 `os.userInfo()`
+抛 ENOENT** 的沙盒路径。
+
+> 未覆盖：本机为 Windows，没有 macOS 沙盒真机；第 5 项是靠代码路径确认的。
+
 ## [0.6.17] — 2026-10-19
 
 ### 安全加固：受管服务入口鉴权（PR #95 静态审查闭环）
